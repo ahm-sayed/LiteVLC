@@ -4,9 +4,9 @@
         xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
         Title="LiteVLC"
         Icon="pack://application:,,,/Assets/LiteVLC.ico"
-        Width="1120"
+        Width="1180"
         Height="742"
-        MinWidth="820"
+        MinWidth="960"
         MinHeight="520"
         WindowStartupLocation="CenterScreen"
         Background="#080A0F"
@@ -104,6 +104,34 @@
                                       Width="12" Height="12" Stretch="Uniform" Margin="0,0,6,0"/>
                                 <TextBlock Text="Subtitles" FontSize="12" VerticalAlignment="Center"/>
                             </StackPanel>
+                        </Button>
+
+                        <!-- Quick Audio-to-Subtitle Sync Check Button -->
+                        <Button x:Name="SubSyncBtn"
+                                Style="{StaticResource PillButtonStyle}"
+                                Padding="8,4"
+                                Margin="6,0,0,0"
+                                shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                                Click="CheckSubSync_Click"
+                                ToolTip="Check &amp; Sync Active Subtitle to Video Speech Audio (Y / Shift+S)">
+                            <StackPanel Orientation="Horizontal">
+                                <Path Data="M 2,10 L 4.5,10 L 6.5,4 L 9.5,16 L 12,7 L 14,10 L 17,10"
+                                      Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                                      StrokeThickness="1.6" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" Fill="Transparent"
+                                      Width="13" Height="12" Stretch="Uniform" Margin="0,0,5,0"/>
+                                <TextBlock x:Name="SubSyncBtnText" Text="Sync Check" FontSize="11" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
+
+                        <!-- Auto-Sync Subtitles on Every Video Toggle Pill -->
+                        <Button x:Name="AutoSyncBadgeBtn"
+                                Style="{StaticResource PillButtonStyle}"
+                                Padding="7,4"
+                                Margin="4,0,0,0"
+                                shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                                Click="ToggleAutoSync_Click"
+                                ToolTip="Automatically check &amp; sync subtitle audio on every video you open">
+                            <TextBlock x:Name="AutoSyncBadgeText" Text="Auto: ON" FontSize="11"/>
                         </Button>
                     </StackPanel>
 
@@ -406,7 +434,7 @@
 
                                 <!-- Quick Shortcut Strip -->
                                 <Border Background="#0A0D14" BorderBrush="#1B2236" BorderThickness="1" CornerRadius="10" Padding="14,10">
-                                    <TextBlock Text="Drag &amp; Drop videos or .srt subtitles  •  Space: Play  •  ← / →: ±10s  •  0: Restart  •  Double-Click / F: Fullscreen"
+                                    <TextBlock Text="Drag &amp; Drop videos or .srt subtitles  •  Space: Play  •  ← / →: ±10s  •  Y: Sync Subs  •  0: Restart  •  F: Fullscreen"
                                                Foreground="#64748B"
                                                FontSize="11.5"
                                                TextWrapping="Wrap"

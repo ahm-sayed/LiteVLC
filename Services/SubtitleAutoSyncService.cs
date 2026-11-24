@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -9,6 +10,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using LiteVLC.Engine;
+using LiteVLC.Models;
 
 namespace LiteVLC.Services;
 
@@ -16,6 +18,7 @@ public sealed class VoiceFingerprint
 {
     public string VideoPath { get; init; } = "";
     public long FileSize { get; init; }
+    public int AudioTrackId { get; init; }
     public double BinSeconds { get; init; } = 0.1; // 10 Hz (100ms bins)
     public double AnalyzedDurationSeconds { get; init; }
     public float[] SpeechActivity { get; init; } = Array.Empty<float>(); // zero-mean normalized [-1..+1]
@@ -33,19 +36,18 @@ public sealed class SubtitleSyncResult
     public string Summary { get; init; } = "";
 }
 
-internal sealed class SrtCue
+public sealed class SubtitleCue
 {
     public int Index { get; set; }
     public double StartSec { get; set; }
     public double EndSec { get; set; }
-    public string Body { get; set; } = "";
 }
 
 /// <summary>
 /// Automatic Audio-Speech Subtitle Synchronizer (ffsubsync-inspired cross-correlation engine).
 /// Uses bundled libmpv-2.dll to extract a 4kHz human-voice-band (300-1800 Hz) speech activity envelope,
-/// cross-correlates it against SRT cue intervals across [-90s..+90s] and common FPS ratios (23.976 <-> 25.0),
-/// and permanently rewrites the SRT timestamps for tight speech synchronization.
+/// supports external (.srt/.vtt/.ass/.ssa) AND embedded (MKV/MP4) subtitle tracks,
+/// and cross-correlates cue intervals across [-90s..+90s] and common FPS ratios (23.976 <-> 25.0).
 /// </summary>
 public static class SubtitleAutoSyncService
 {
@@ -62,6 +64,106 @@ public static class SubtitleAutoSyncService
         @"(\d{1,2}):(\d{2}):(\d{2})[,\.](\d{1,3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,\.](\d{1,3})",
         RegexOptions.Compiled);
 
+    private static readonly Regex VttShortTimeRegex = new(
+        @"(?<!\d:)(\d{1,2}):(\d{2})\.(\d{1,3})\s*-->\s*(\d{1,2}):(\d{2})\.(\d{1,3})",
+        RegexOptions.Compiled);
+
+    private static readonly Regex AssDialogueRegex = new(
+        @"^Dialogue:\s*\d+\s*,\s*(\d{1,2}):(\d{2}):(\d{2})\.(\d{1,2})\s*,\s*(\d{1,2}):(\d{2}):(\d{2})\.(\d{1,2})\s*,",
+        RegexOptions.Compiled | RegexOptions.Multiline | RegexOptions.IgnoreCase);
+
+    private static readonly HashSet<string> BitmapSubtitleCodecs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "hdmv_pgs_subtitle", "pgssub", "dvd_subtitle", "vobsub", "dvb_subtitle", "dvbsub", "xsub"
+    };
+
+    static SubtitleAutoSyncService()
+    {
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+    }
+
+    public static string BuildTrackCacheKey(string videoPath, MediaTrack subTrack, int activeAudioTrackId)
+    {
+        long vidSize = 0;
+        try { if (File.Exists(videoPath)) vidSize = new FileInfo(videoPath).Length; } catch { }
+
+        if (subTrack.External && !string.IsNullOrWhiteSpace(subTrack.ExternalFilename))
+        {
+            long subSize = 0;
+            long subTicks = 0;
+            try
+            {
+                if (File.Exists(subTrack.ExternalFilename))
+                {
+                    var fi = new FileInfo(subTrack.ExternalFilename);
+                    subSize = fi.Length;
+                    subTicks = fi.LastWriteTimeUtc.Ticks;
+                }
+            }
+            catch { }
+            return $"{videoPath}|{vidSize}|aid:{activeAudioTrackId}|ext:{subTrack.ExternalFilename}|{subSize}|{subTicks}";
+        }
+
+        return $"{videoPath}|{vidSize}|aid:{activeAudioTrackId}|emb:{subTrack.Id}:{subTrack.FfIndex}:{subTrack.Codec}";
+    }
+
+    /// <summary>
+    /// High-level check for the currently playing video's active subtitle track (external OR embedded).
+    /// </summary>
+    public static async Task<SubtitleSyncResult> AnalyzeActiveTrackAsync(
+        string videoPath,
+        double videoDurationSeconds,
+        MediaTrack subTrack,
+        int activeAudioTrackId,
+        IProgress<string>? statusProgress,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(videoPath) || !File.Exists(videoPath))
+            throw new FileNotFoundException("Local video file is required for audio auto-sync.", videoPath);
+
+        if (subTrack.External && !string.IsNullOrWhiteSpace(subTrack.ExternalFilename) && File.Exists(subTrack.ExternalFilename))
+        {
+            var fp = await GetOrExtractVoiceFingerprintAsync(videoPath, videoDurationSeconds, statusProgress, ct, activeAudioTrackId)
+                .ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+
+            statusProgress?.Report("Aligning external subtitle to speech...");
+            return await Task.Run(() =>
+            {
+                string text = ReadSubtitleTextSmart(subTrack.ExternalFilename);
+                var cues = ParseAnySubtitleCues(text, Path.GetExtension(subTrack.ExternalFilename));
+                return AnalyzeSubtitleCues(cues, fp);
+            }, ct).ConfigureAwait(false);
+        }
+
+        // Embedded track inside MKV / MP4 / etc. — run voice analysis + embedded subtitle extraction in parallel!
+        double analyzeEnd = videoDurationSeconds > 5
+            ? Math.Min(videoDurationSeconds, MaxAnalyzeSeconds)
+            : MaxAnalyzeSeconds;
+
+        var fpTask = GetOrExtractVoiceFingerprintAsync(videoPath, videoDurationSeconds, statusProgress, ct, activeAudioTrackId);
+        var cueTask = ExtractEmbeddedSubtitleCuesAsync(videoPath, subTrack, analyzeEnd, ct);
+
+        await Task.WhenAll(fpTask, cueTask).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
+
+        var fingerprint = await fpTask.ConfigureAwait(false);
+        var cues = await cueTask.ConfigureAwait(false);
+
+        if (cues.Count < 4 && BitmapSubtitleCodecs.Contains(subTrack.Codec))
+        {
+            return new SubtitleSyncResult
+            {
+                Succeeded = false,
+                CueCount = cues.Count,
+                Summary = "Image subtitle (PGS/VobSub) cannot be auto-synced"
+            };
+        }
+
+        statusProgress?.Report("Aligning embedded subtitle to speech...");
+        return await Task.Run(() => AnalyzeSubtitleCues(cues, fingerprint), ct).ConfigureAwait(false);
+    }
+
     /// <summary>
     /// Extracts (or returns cached) 10Hz human-voice activity envelope directly from the video using libmpv-2.dll.
     /// </summary>
@@ -69,7 +171,8 @@ public static class SubtitleAutoSyncService
         string videoPath,
         double videoDurationSeconds,
         IProgress<string>? statusProgress,
-        CancellationToken ct)
+        CancellationToken ct,
+        int audioTrackId = 0)
     {
         if (string.IsNullOrWhiteSpace(videoPath) || !File.Exists(videoPath))
             throw new FileNotFoundException("Local video file is required for audio auto-sync.", videoPath);
@@ -79,7 +182,8 @@ public static class SubtitleAutoSyncService
         {
             if (_cachedFingerprint != null &&
                 string.Equals(_cachedFingerprint.VideoPath, videoPath, StringComparison.OrdinalIgnoreCase) &&
-                _cachedFingerprint.FileSize == size)
+                _cachedFingerprint.FileSize == size &&
+                _cachedFingerprint.AudioTrackId == audioTrackId)
             {
                 return Task.FromResult(_cachedFingerprint);
             }
@@ -88,7 +192,7 @@ public static class SubtitleAutoSyncService
         return Task.Run(() =>
         {
             statusProgress?.Report("Analyzing video speech audio (300–1800 Hz)...");
-            var fp = ExtractVoiceFingerprintBlocking(videoPath, size, videoDurationSeconds, ct);
+            var fp = ExtractVoiceFingerprintBlocking(videoPath, size, videoDurationSeconds, audioTrackId, ct);
             lock (CacheLock)
             {
                 _cachedFingerprint = fp;
@@ -101,6 +205,7 @@ public static class SubtitleAutoSyncService
         string videoPath,
         long fileSize,
         double videoDurationSeconds,
+        int audioTrackId,
         CancellationToken ct)
     {
         double analyzeEnd = videoDurationSeconds > 5
@@ -116,6 +221,8 @@ public static class SubtitleAutoSyncService
         {
             MpvNative.mpv_set_option_string(handle, "vid", "no");
             MpvNative.mpv_set_option_string(handle, "vo", "null");
+            if (audioTrackId > 0)
+                MpvNative.mpv_set_option_string(handle, "aid", audioTrackId.ToString(CultureInfo.InvariantCulture));
             MpvNative.mpv_set_option_string(handle, "ao", "pcm");
             MpvNative.mpv_set_option_string(handle, "ao-pcm-file", tempPcm);
             MpvNative.mpv_set_option_string(handle, "ao-pcm-waveheader", "no");
@@ -184,13 +291,14 @@ public static class SubtitleAutoSyncService
                 logEnergy[b] = Math.Log10(rms + 1e-5);
             }
 
-            // Adaptive local noise floor over +/- 20s window -> clean binary-like soft VAD [-1..+1]
+            // Adaptive local noise floor over +/- 15s window -> clean soft VAD [-1..+1]
             float[] activity = BuildAdaptiveSpeechActivity(logEnergy);
 
             return new VoiceFingerprint
             {
                 VideoPath = videoPath,
                 FileSize = fileSize,
+                AudioTrackId = audioTrackId,
                 BinSeconds = BinSeconds,
                 AnalyzedDurationSeconds = binCount * BinSeconds,
                 SpeechActivity = activity
@@ -202,17 +310,152 @@ public static class SubtitleAutoSyncService
         }
     }
 
+    private static Task<List<SubtitleCue>> ExtractEmbeddedSubtitleCuesAsync(
+        string videoPath,
+        MediaTrack subTrack,
+        double maxAnalyzeSeconds,
+        CancellationToken ct)
+    {
+        return Task.Run(() =>
+        {
+            // Fast Path: if system ffmpeg is available and this is a text subtitle with ff-index, extract in ~60-120ms without decoding video!
+            if (subTrack.FfIndex >= 0 && !BitmapSubtitleCodecs.Contains(subTrack.Codec) && VideoTrimService.IsSystemFfmpegAvailable())
+            {
+                try
+                {
+                    var fastCues = ExtractEmbeddedWithFfmpeg(videoPath, subTrack.FfIndex, maxAnalyzeSeconds, ct);
+                    if (fastCues.Count >= 4)
+                        return fastCues;
+                }
+                catch (OperationCanceledException) { throw; }
+                catch { /* fall back cleanly to bundled libmpv */ }
+            }
+
+            // Universal Fallback: extract embedded subtitle timestamps natively using bundled libmpv-2.dll (works on EVERY PC!)
+            return ExtractEmbeddedWithLibMpv(videoPath, subTrack.Id, maxAnalyzeSeconds, ct);
+        }, ct);
+    }
+
+    private static List<SubtitleCue> ExtractEmbeddedWithFfmpeg(
+        string videoPath,
+        int ffIndex,
+        double maxAnalyzeSeconds,
+        CancellationToken ct)
+    {
+        string dur = (maxAnalyzeSeconds + 100.0).ToString("0.###", CultureInfo.InvariantCulture);
+        var psi = new ProcessStartInfo
+        {
+            FileName = "ffmpeg",
+            Arguments = $"-v error -t {dur} -i \"{videoPath}\" -map 0:{ffIndex} -f srt -",
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            CreateNoWindow = true
+        };
+
+        using var proc = Process.Start(psi);
+        if (proc == null) return new List<SubtitleCue>();
+
+        using var reg = ct.Register(() => { try { if (!proc.HasExited) proc.Kill(true); } catch { } });
+        string output = proc.StandardOutput.ReadToEnd();
+        proc.WaitForExit(15000);
+        ct.ThrowIfCancellationRequested();
+
+        return ParseAnySubtitleCues(output, ".srt");
+    }
+
+    private static List<SubtitleCue> ExtractEmbeddedWithLibMpv(
+        string videoPath,
+        int subTrackId,
+        double maxAnalyzeSeconds,
+        CancellationToken ct)
+    {
+        var cues = new List<SubtitleCue>();
+        var seen = new HashSet<long>();
+
+        IntPtr handle = MpvNative.mpv_create();
+        if (handle == IntPtr.Zero) return cues;
+
+        try
+        {
+            MpvNative.mpv_set_option_string(handle, "vo", "null");
+            MpvNative.mpv_set_option_string(handle, "ao", "null");
+            MpvNative.mpv_set_option_string(handle, "aid", "no");
+            MpvNative.mpv_set_option_string(handle, "sid", Math.Max(1, subTrackId).ToString(CultureInfo.InvariantCulture));
+            MpvNative.mpv_set_option_string(handle, "untimed", "yes");
+            MpvNative.mpv_set_option_string(handle, "vd-lavc-fast", "yes");
+            MpvNative.mpv_set_option_string(handle, "vd-lavc-skiploopfilter", "all");
+            MpvNative.mpv_set_option_string(handle, "vd-lavc-skipframe", "nonref");
+            MpvNative.mpv_set_option_string(handle, "end", (maxAnalyzeSeconds + 95.0).ToString("0.###", CultureInfo.InvariantCulture));
+            MpvNative.mpv_set_option_string(handle, "config", "no");
+            MpvNative.mpv_set_option_string(handle, "load-scripts", "no");
+
+            if (MpvNative.mpv_initialize(handle) < 0)
+                return cues;
+
+            MpvNative.mpv_observe_property(handle, 10, "sub-start", MpvFormat.Double);
+            MpvNative.CommandUtf8(handle, false, "loadfile", videoPath, "replace");
+
+            while (true)
+            {
+                if (ct.IsCancellationRequested)
+                {
+                    MpvNative.CommandUtf8(handle, true, "quit");
+                    ct.ThrowIfCancellationRequested();
+                }
+
+                IntPtr evPtr = MpvNative.mpv_wait_event(handle, 0.1);
+                if (evPtr == IntPtr.Zero) continue;
+
+                var ev = Marshal.PtrToStructure<MpvEvent>(evPtr);
+                if (ev.EventId == MpvEventId.PropertyChange && ev.ReplyUserdata == 10)
+                {
+                    if (MpvNative.mpv_get_property(handle, "sub-start", MpvFormat.Double, out double s) >= 0 && s >= 0)
+                    {
+                        double e = s + 2.5;
+                        if (MpvNative.mpv_get_property(handle, "sub-end", MpvFormat.Double, out double endProp) >= 0 && endProp > s)
+                            e = endProp;
+
+                        if (e - s < 45.0)
+                        {
+                            long key = ((long)Math.Round(s * 100) << 24) ^ (long)Math.Round(e * 100);
+                            if (seen.Add(key))
+                            {
+                                cues.Add(new SubtitleCue
+                                {
+                                    Index = cues.Count + 1,
+                                    StartSec = s,
+                                    EndSec = e
+                                });
+                            }
+                        }
+                    }
+                }
+                else if (ev.EventId == MpvEventId.EndFile || ev.EventId == MpvEventId.Shutdown)
+                {
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            MpvNative.mpv_terminate_destroy(handle);
+        }
+
+        cues.Sort((a, b) => a.StartSec.CompareTo(b.StartSec));
+        return cues;
+    }
+
     private static float[] BuildAdaptiveSpeechActivity(double[] logEnergy)
     {
         int n = logEnergy.Length;
-        // Global adaptive threshold at ~42nd percentile (typical movies have ~35-55% non-speech)
         double[] sorted = (double[])logEnergy.Clone();
         Array.Sort(sorted);
         double globalFloor = sorted[(int)(n * 0.35)];
         double globalHigh = sorted[(int)(n * 0.85)];
         double globalSpan = Math.Max(0.25, globalHigh - globalFloor);
 
-        // Local 30s moving average helps separate dialogue from loud/quiet scenes
         double[] prefix = new double[n + 1];
         for (int i = 0; i < n; i++) prefix[i + 1] = prefix[i] + logEnergy[i];
 
@@ -226,14 +469,12 @@ public static class SubtitleAutoSyncService
             int hi = Math.Min(n, i + halfWin + 1);
             double localAvg = (prefix[hi] - prefix[lo]) / (hi - lo);
             double threshold = (localAvg * 0.55) + ((globalFloor + globalSpan * 0.38) * 0.45);
-            // Soft sigmoid-like speech probability [0..1]
             double delta = (logEnergy[i] - threshold) / (globalSpan * 0.22);
             double prob = 1.0 / (1.0 + Math.Exp(-Math.Clamp(delta, -8, 8)));
             rawVad[i] = (float)prob;
             mean += prob;
         }
 
-        // Smooth with 3-bin box filter (300ms) & zero-mean normalize for crisp correlation peaks
         mean /= n;
         float[] zeroMean = new float[n];
         for (int i = 0; i < n; i++)
@@ -248,18 +489,60 @@ public static class SubtitleAutoSyncService
     }
 
     /// <summary>
+    /// Reads a local subtitle file with BOM + strict UTF-8 + Arabic Windows-1256 auto-detection.
+    /// </summary>
+    public static string ReadSubtitleTextSmart(string path)
+    {
+        byte[] bytes = File.ReadAllBytes(path);
+        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+            return Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3);
+        if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
+            return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);
+        if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+            return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);
+
+        try
+        {
+            var strictUtf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+            return strictUtf8.GetString(bytes);
+        }
+        catch
+        {
+            // Legacy 8-bit encoding: distinguish Arabic CP1256 (letters 0xC1..0xED) vs Western CP1252
+            int highCount = 0;
+            int arabicRange = 0;
+            foreach (byte b in bytes)
+            {
+                if (b >= 0x80)
+                {
+                    highCount++;
+                    if (b is >= 0xC1 and <= 0xED)
+                        arabicRange++;
+                }
+            }
+            int cp = (highCount > 0 && (double)arabicRange / highCount >= 0.45) ? 1256 : 1252;
+            return Encoding.GetEncoding(cp).GetString(bytes);
+        }
+    }
+
+    /// <summary>
     /// Evaluates how well a subtitle file aligns to the video's speech fingerprint,
     /// finding the optimal offset (-90s..+90s) and FPS stretch ratio (1.0, 23.976/25, 25/23.976).
     /// </summary>
-    public static SubtitleSyncResult AnalyzeSubtitleSync(string srtPath, VoiceFingerprint fingerprint)
+    public static SubtitleSyncResult AnalyzeSubtitleSync(string subtitlePath, VoiceFingerprint fingerprint)
     {
-        string text = File.ReadAllText(srtPath, Encoding.UTF8);
-        return AnalyzeSubtitleText(text, fingerprint);
+        string text = ReadSubtitleTextSmart(subtitlePath);
+        return AnalyzeSubtitleText(text, fingerprint, Path.GetExtension(subtitlePath));
     }
 
-    public static SubtitleSyncResult AnalyzeSubtitleText(string srtText, VoiceFingerprint fingerprint)
+    public static SubtitleSyncResult AnalyzeSubtitleText(string subtitleText, VoiceFingerprint fingerprint, string? extensionHint = null)
     {
-        var cues = ParseSrtCues(srtText);
+        var cues = ParseAnySubtitleCues(subtitleText, extensionHint);
+        return AnalyzeSubtitleCues(cues, fingerprint);
+    }
+
+    public static SubtitleSyncResult AnalyzeSubtitleCues(List<SubtitleCue> cues, VoiceFingerprint fingerprint)
+    {
         if (cues.Count < 4)
         {
             return new SubtitleSyncResult
@@ -415,14 +698,21 @@ public static class SubtitleAutoSyncService
     /// </summary>
     public static SubtitleSyncResult SyncAndRewriteSrtFile(string srtPath, VoiceFingerprint fingerprint)
     {
-        string text = File.ReadAllText(srtPath, Encoding.UTF8);
-        var result = AnalyzeSubtitleText(text, fingerprint);
+        string text = ReadSubtitleTextSmart(srtPath);
+        var result = AnalyzeSubtitleText(text, fingerprint, ".srt");
         if (result.WasModified)
         {
             string syncedText = TransformSrtTimestamps(text, result.SpeedScale, result.OffsetSeconds);
             File.WriteAllText(srtPath, syncedText, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
         }
         return result;
+    }
+
+    public static void SaveSyncedSrtFile(string srtPath, double speedScale, double offsetSeconds)
+    {
+        string text = ReadSubtitleTextSmart(srtPath);
+        string syncedText = TransformSrtTimestamps(text, speedScale, offsetSeconds);
+        File.WriteAllText(srtPath, syncedText, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
     }
 
     public static string TransformSrtTimestamps(string srtText, double scale, double offsetSeconds)
@@ -437,7 +727,7 @@ public static class SubtitleAutoSyncService
         });
     }
 
-    private static float[] BuildSubtitleSpeechVector(List<SrtCue> cues, double scale, int lengthBins)
+    private static float[] BuildSubtitleSpeechVector(List<SubtitleCue> cues, double scale, int lengthBins)
     {
         float[] vec = new float[lengthBins];
         double activeCount = 0;
@@ -486,23 +776,49 @@ public static class SubtitleAutoSyncService
         return dot / denom;
     }
 
-    private static List<SrtCue> ParseSrtCues(string text)
+    public static List<SubtitleCue> ParseAnySubtitleCues(string text, string? extensionHint = null)
     {
-        var list = new List<SrtCue>();
-        foreach (Match m in SrtTimeRegex.Matches(text))
+        var list = new List<SubtitleCue>();
+        if (string.IsNullOrWhiteSpace(text)) return list;
+
+        bool preferAss = extensionHint != null &&
+                         (extensionHint.Equals(".ass", StringComparison.OrdinalIgnoreCase) ||
+                          extensionHint.Equals(".ssa", StringComparison.OrdinalIgnoreCase));
+
+        if (!preferAss)
         {
-            double start = ParseMatchTime(m, 1);
-            double end = ParseMatchTime(m, 5);
-            if (end > start && end - start < 45.0) // ignore bogus full-movie banners
+            foreach (Match m in SrtTimeRegex.Matches(text))
             {
-                list.Add(new SrtCue
+                double start = ParseMatchTime(m, 1);
+                double end = ParseMatchTime(m, 5);
+                if (end > start && end - start < 45.0)
+                    list.Add(new SubtitleCue { Index = list.Count + 1, StartSec = start, EndSec = end });
+            }
+
+            if (list.Count < 4)
+            {
+                foreach (Match m in VttShortTimeRegex.Matches(text))
                 {
-                    Index = list.Count + 1,
-                    StartSec = start,
-                    EndSec = end
-                });
+                    double start = ParseShortVttTime(m, 1);
+                    double end = ParseShortVttTime(m, 4);
+                    if (end > start && end - start < 45.0)
+                        list.Add(new SubtitleCue { Index = list.Count + 1, StartSec = start, EndSec = end });
+                }
             }
         }
+
+        if (list.Count < 4)
+        {
+            foreach (Match m in AssDialogueRegex.Matches(text))
+            {
+                double start = ParseAssTime(m, 1);
+                double end = ParseAssTime(m, 5);
+                if (end > start && end - start < 45.0)
+                    list.Add(new SubtitleCue { Index = list.Count + 1, StartSec = start, EndSec = end });
+            }
+        }
+
+        list.Sort((a, b) => a.StartSec.CompareTo(b.StartSec));
         return list;
     }
 
@@ -514,6 +830,25 @@ public static class SubtitleAutoSyncService
         string msStr = m.Groups[groupOffset + 3].Value.PadRight(3, '0');
         int ms = int.Parse(msStr[..3], CultureInfo.InvariantCulture);
         return h * 3600.0 + min * 60.0 + sec + ms / 1000.0;
+    }
+
+    private static double ParseShortVttTime(Match m, int groupOffset)
+    {
+        int min = int.Parse(m.Groups[groupOffset].Value, CultureInfo.InvariantCulture);
+        int sec = int.Parse(m.Groups[groupOffset + 1].Value, CultureInfo.InvariantCulture);
+        string msStr = m.Groups[groupOffset + 2].Value.PadRight(3, '0');
+        int ms = int.Parse(msStr[..3], CultureInfo.InvariantCulture);
+        return min * 60.0 + sec + ms / 1000.0;
+    }
+
+    private static double ParseAssTime(Match m, int groupOffset)
+    {
+        int h = int.Parse(m.Groups[groupOffset].Value, CultureInfo.InvariantCulture);
+        int min = int.Parse(m.Groups[groupOffset + 1].Value, CultureInfo.InvariantCulture);
+        int sec = int.Parse(m.Groups[groupOffset + 2].Value, CultureInfo.InvariantCulture);
+        string csStr = m.Groups[groupOffset + 3].Value.PadRight(2, '0');
+        int cs = int.Parse(csStr[..2], CultureInfo.InvariantCulture);
+        return h * 3600.0 + min * 60.0 + sec + cs / 100.0;
     }
 
     private static string FormatSrtTime(double seconds)

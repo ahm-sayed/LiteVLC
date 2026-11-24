@@ -54,6 +54,8 @@ public sealed class MediaTrack
     public string Codec { get; init; } = "";
     public bool Selected { get; init; }
     public bool External { get; init; }
+    public string ExternalFilename { get; init; } = "";
+    public int FfIndex { get; init; } = -1;
 
     public string DisplayName
     {
@@ -174,15 +176,24 @@ public enum LoopMode
     RepeatOne = 2
 }
 
+public sealed class SavedSubtitleSync
+{
+    public double OffsetSeconds { get; set; }
+    public double SpeedScale { get; set; } = 1.0;
+    public double ConfidenceZ { get; set; }
+}
+
 public sealed class AppPersistedState
 {
     public double Volume { get; set; } = 100;
     public bool FastSeek { get; set; } = true;
     public bool RememberPosition { get; set; } = true;
     public bool AudioBoost { get; set; } = true;
+    public bool AutoSyncSubtitles { get; set; } = true;
     public string PreferredSubLang { get; set; } = "ara";
     public List<string> RecentFiles { get; set; } = new();
     public Dictionary<string, double> ResumePositions { get; set; } = new();
+    public Dictionary<string, SavedSubtitleSync> SubtitleSyncCache { get; set; } = new();
 }
 
 public static class StateStore
@@ -220,6 +231,12 @@ public static class StateStore
                 var keys = new List<string>(state.ResumePositions.Keys);
                 for (int i = 0; i < keys.Count - 150; i++)
                     state.ResumePositions.Remove(keys[i]);
+            }
+            if (state.SubtitleSyncCache.Count > 250)
+            {
+                var keys = new List<string>(state.SubtitleSyncCache.Keys);
+                for (int i = 0; i < keys.Count - 180; i++)
+                    state.SubtitleSyncCache.Remove(keys[i]);
             }
             var json = JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(StateFile, json);

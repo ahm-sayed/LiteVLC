@@ -40,6 +40,7 @@ public sealed class MpvEngine : IDisposable
     public bool FastSeekEnabled { get; private set; } = true;
     public bool AudioBoostEnabled { get; private set; } = true;
     public double SubDelay { get; private set; }
+    public double SubSpeed { get; private set; } = 1.0;
     public bool HasMedia { get; private set; }
     public bool HasVideo { get; private set; }
     public string CurrentTitle { get; private set; } = "";
@@ -61,6 +62,7 @@ public sealed class MpvEngine : IDisposable
     public event Action? FileLoadFailed;
     public event Action<bool>? FileEnded; // true = normal EOF
     public event Action? TracksChanged;
+    public event Action? SubtitleTrackChanged;
     public event Action<double, double>? SeekPreview; // (accumulatedDelta, predictedPos)
     public event Action<double>? SeekCompleted; // elapsedMs
 
@@ -73,6 +75,7 @@ public sealed class MpvEngine : IDisposable
     private const ulong PropMediaTitle = 7;
     private const ulong PropCacheDuration = 8;
     private const ulong PropTrackListCount = 9;
+    private const ulong PropSid = 10;
 
     public MpvEngine()
     {
@@ -173,6 +176,7 @@ public sealed class MpvEngine : IDisposable
             MpvNative.mpv_observe_property(_handle, PropMediaTitle, "media-title", MpvFormat.String);
             MpvNative.mpv_observe_property(_handle, PropCacheDuration, "demuxer-cache-duration", MpvFormat.Double);
             MpvNative.mpv_observe_property(_handle, PropTrackListCount, "track-list/count", MpvFormat.Int64);
+            MpvNative.mpv_observe_property(_handle, PropSid, "sid", MpvFormat.String);
 
             _running = true;
             _eventThread = new Thread(EventLoop)
@@ -200,6 +204,7 @@ public sealed class MpvEngine : IDisposable
     {
         if (_handle == IntPtr.Zero || string.IsNullOrWhiteSpace(path)) return;
         CancelPendingSeek();
+        ResetSubDelay();
         HasMedia = true;
 
         if (resumeSeconds is > 2.0)
@@ -218,6 +223,7 @@ public sealed class MpvEngine : IDisposable
     {
         if (_handle == IntPtr.Zero) return;
         CancelPendingSeek();
+        ResetSubDelay();
         HasMedia = false;
         Position = 0;
         Duration = 0;
@@ -391,14 +397,48 @@ public sealed class MpvEngine : IDisposable
         return SubDelay;
     }
 
-    public void ResetSubDelay()
+    public void SetSubSync(double delaySeconds, double speedScale = 1.0)
     {
-        SubDelay = 0;
+        SubDelay = Math.Round(delaySeconds, 2);
+        SubSpeed = Math.Clamp(speedScale, 0.5, 2.0);
         if (_handle != IntPtr.Zero)
         {
-            double val = 0;
-            MpvNative.mpv_set_property(_handle, "sub-delay", MpvFormat.Double, ref val);
+            double spd = SubSpeed;
+            double dly = SubDelay;
+            MpvNative.mpv_set_property(_handle, "sub-speed", MpvFormat.Double, ref spd);
+            MpvNative.mpv_set_property(_handle, "sub-delay", MpvFormat.Double, ref dly);
         }
+    }
+
+    public void ResetSubDelay()
+    {
+        SetSubSync(0.0, 1.0);
+    }
+
+    public void ReloadExternalSubtitles()
+    {
+        if (_handle == IntPtr.Zero) return;
+        MpvNative.CommandUtf8(_handle, true, "sub-reload");
+    }
+
+    public MediaTrack? GetActiveSubtitleTrack()
+    {
+        foreach (var t in GetTracks())
+        {
+            if (t.Type == "sub" && t.Selected)
+                return t;
+        }
+        return null;
+    }
+
+    public MediaTrack? GetActiveAudioTrack()
+    {
+        foreach (var t in GetTracks())
+        {
+            if (t.Type == "audio" && t.Selected)
+                return t;
+        }
+        return null;
     }
 
     public void AdjustVolume(double delta) => SetVolume(Volume + delta);
@@ -507,6 +547,12 @@ public sealed class MpvEngine : IDisposable
                 string codec = el.TryGetProperty("codec", out var cProp) ? (cProp.GetString() ?? "") : "";
                 bool selected = el.TryGetProperty("selected", out var sProp) && sProp.ValueKind == JsonValueKind.True;
                 bool external = el.TryGetProperty("external", out var eProp) && eProp.ValueKind == JsonValueKind.True;
+                string extFile = el.TryGetProperty("external-filename", out var efProp) && efProp.ValueKind == JsonValueKind.String
+                    ? (efProp.GetString() ?? "")
+                    : "";
+                int ffIndex = el.TryGetProperty("ff-index", out var ffProp) && ffProp.ValueKind == JsonValueKind.Number
+                    ? ffProp.GetInt32()
+                    : -1;
 
                 list.Add(new MediaTrack
                 {
@@ -516,7 +562,9 @@ public sealed class MpvEngine : IDisposable
                     Lang = lang,
                     Codec = codec,
                     Selected = selected,
-                    External = external
+                    External = external,
+                    ExternalFilename = extFile,
+                    FfIndex = ffIndex
                 });
             }
         }
@@ -746,6 +794,10 @@ public sealed class MpvEngine : IDisposable
 
             case PropTrackListCount:
                 TracksChanged?.Invoke();
+                break;
+
+            case PropSid:
+                SubtitleTrackChanged?.Invoke();
                 break;
         }
     }

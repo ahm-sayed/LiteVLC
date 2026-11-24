@@ -4,6 +4,8 @@ using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -38,6 +40,11 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _fsMousePollTimer;
     private readonly DispatcherTimer _clickTimer;
     private readonly DispatcherTimer _autoSaveTimer;
+    private readonly DispatcherTimer _autoSyncDebounceTimer;
+
+    private CancellationTokenSource? _subSyncCts;
+    private bool _isSubSyncChecking;
+    private string? _lastCheckedSubKey;
 
     private int _fsLastCursorX;
     private int _fsLastCursorY;
@@ -195,6 +202,15 @@ public partial class MainWindow : Window
             }
         };
 
+        // Debounce automatic subtitle-to-audio sync check after FileLoaded / SubtitleTrackChanged
+        _autoSyncDebounceTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(700) };
+        _autoSyncDebounceTimer.Tick += (_, _) =>
+        {
+            _autoSyncDebounceTimer.Stop();
+            if (_state.AutoSyncSubtitles)
+                _ = RunSubtitleSyncCheckAsync(isManual: false);
+        };
+
         // Distinguish single-click (Play/Pause) from double-click (Fullscreen) cleanly
         _clickTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(210) };
         _clickTimer.Tick += (_, _) =>
@@ -223,6 +239,8 @@ public partial class MainWindow : Window
         UpdateFastSeekBadge(_state.FastSeek);
         UpdateResumeBadge(_state.RememberPosition);
         UpdateAudioBoostBadge(_state.AudioBoost);
+        UpdateAutoSyncBadge(_state.AutoSyncSubtitles);
+        SetSubSyncButtonState(SubSyncUiState.Idle);
         RefreshRecentFilesUi();
     }
 
@@ -339,6 +357,24 @@ public partial class MainWindow : Window
         {
             SeekThumb.Visibility = Visibility.Visible;
             SyncOverlayBounds();
+            if (_state.AutoSyncSubtitles)
+                ScheduleAutoSubSync();
+        });
+
+        _engine.SubtitleTrackChanged += () => Dispatcher.BeginInvoke(() =>
+        {
+            if (!_engine.HasMedia) return;
+            var active = _engine.GetActiveSubtitleTrack();
+            if (active == null)
+            {
+                CancelSubtitleSyncCheck(resetBadge: true);
+                _lastCheckedSubKey = null;
+                return;
+            }
+            if (_state.AutoSyncSubtitles)
+                ScheduleAutoSubSync();
+            else
+                SetSubSyncButtonState(SubSyncUiState.Idle);
         });
 
         _engine.VideoOutputChanged += hasVideo => Dispatcher.BeginInvoke(() =>
@@ -358,12 +394,14 @@ public partial class MainWindow : Window
 
         _engine.FileLoadFailed += () => Dispatcher.BeginInvoke(() =>
         {
+            CancelSubtitleSyncCheck(resetBadge: true);
             ShowStage(StageMode.Empty);
             ShowOsd("Unable to Play File", "File missing or unsupported");
         });
 
         _engine.FileEnded += isEof => Dispatcher.BeginInvoke(() =>
         {
+            CancelSubtitleSyncCheck(resetBadge: true);
             if (!isEof) return;
             // Clear saved resume position on clean finish
             if (_currentIndex >= 0 && _currentIndex < _playlist.Count)
@@ -473,6 +511,8 @@ public partial class MainWindow : Window
         _fsMousePollTimer.Stop();
         _clickTimer.Stop();
         _autoSaveTimer.Stop();
+        _autoSyncDebounceTimer.Stop();
+        CancelSubtitleSyncCheck(resetBadge: false);
         _fsControls?.Close();
         _osdOverlay?.Close();
         _engine.Dispose();
@@ -642,6 +682,8 @@ public partial class MainWindow : Window
         if (index < 0 || index >= _playlist.Count) return;
 
         SaveCurrentResumePosition();
+        CancelSubtitleSyncCheck(resetBadge: true);
+        _lastCheckedSubKey = null;
 
         for (int i = 0; i < _playlist.Count; i++)
             _playlist[i].IsPlaying = i == index;
@@ -993,7 +1035,13 @@ public partial class MainWindow : Window
                 e.Handled = true;
                 break;
 
-            case Key.S when !ctrl && _engine.HasMedia:
+            case Key.Y when !ctrl && _engine.HasMedia:
+            case Key.S when !ctrl && shift && _engine.HasMedia:
+                _ = RunSubtitleSyncCheckAsync(isManual: true);
+                e.Handled = true;
+                break;
+
+            case Key.S when !ctrl && !shift && _engine.HasMedia:
                 TakeScreenshot();
                 e.Handled = true;
                 break;
@@ -1085,6 +1133,8 @@ public partial class MainWindow : Window
     {
         SaveCurrentResumePosition();
         StateStore.Save(_state);
+        CancelSubtitleSyncCheck(resetBadge: true);
+        _lastCheckedSubKey = null;
         _engine.Stop();
         ShowStage(StageMode.Empty);
     }
@@ -1171,6 +1221,39 @@ public partial class MainWindow : Window
     {
         var menu = new ContextMenu();
         var tracks = _engine.GetTracks().Where(t => t.Type == "sub").ToList();
+        var activeSub = tracks.FirstOrDefault(t => t.Selected);
+
+        var checkSyncNow = new MenuItem
+        {
+            Header = _isSubSyncChecking ? "Cancel Subtitle Sync Check" : "Check & Sync Active Subtitle with Audio",
+            InputGestureText = "Y",
+            IsEnabled = _engine.HasMedia
+        };
+        checkSyncNow.Click += (_, _) => _ = RunSubtitleSyncCheckAsync(isManual: true);
+        menu.Items.Add(checkSyncNow);
+
+        var autoSyncItem = new MenuItem
+        {
+            Header = "Auto-Sync Subtitles on Every Video",
+            IsCheckable = true,
+            IsChecked = _state.AutoSyncSubtitles
+        };
+        autoSyncItem.Click += (_, _) => ToggleAutoSync();
+        menu.Items.Add(autoSyncItem);
+
+        bool canSaveToSrt = activeSub is { External: true }
+                         && !string.IsNullOrWhiteSpace(activeSub.ExternalFilename)
+                         && activeSub.ExternalFilename.EndsWith(".srt", StringComparison.OrdinalIgnoreCase)
+                         && File.Exists(activeSub.ExternalFilename)
+                         && (Math.Abs(_engine.SubDelay) >= 0.1 || Math.Abs(_engine.SubSpeed - 1.0) > 0.001);
+        if (canSaveToSrt)
+        {
+            var savePermanent = new MenuItem { Header = "Save Synced Timing Permanently to .srt File" };
+            savePermanent.Click += (_, _) => SaveCurrentSyncToSrt();
+            menu.Items.Add(savePermanent);
+        }
+
+        menu.Items.Add(new Separator());
 
         var searchOnline = new MenuItem { Header = "Search Subtitles Online...", InputGestureText = "D" };
         searchOnline.Click += (_, _) => OpenSubtitleSearchModal();
@@ -1182,7 +1265,8 @@ public partial class MainWindow : Window
 
         menu.Items.Add(new Separator());
 
-        var syncMinus = new MenuItem { Header = $"Subtitle Sync -0.5s  (current: {_engine.SubDelay:+0.0;-0.0;0.0}s)", InputGestureText = "G" };
+        string speedSuffix = Math.Abs(_engine.SubSpeed - 1.0) > 0.001 ? $" • {_engine.SubSpeed:0.000}x" : "";
+        var syncMinus = new MenuItem { Header = $"Subtitle Sync -0.5s  (current: {_engine.SubDelay:+0.0;-0.0;0.0}s{speedSuffix})", InputGestureText = "G" };
         syncMinus.Click += (_, _) => ShowOsd($"Subtitle Sync {_engine.AdjustSubDelay(-0.5):+0.0;-0.0;0.0}s");
         menu.Items.Add(syncMinus);
 
@@ -1190,10 +1274,15 @@ public partial class MainWindow : Window
         syncPlus.Click += (_, _) => ShowOsd($"Subtitle Sync {_engine.AdjustSubDelay(0.5):+0.0;-0.0;0.0}s");
         menu.Items.Add(syncPlus);
 
-        if (Math.Abs(_engine.SubDelay) > 0.01)
+        if (Math.Abs(_engine.SubDelay) > 0.01 || Math.Abs(_engine.SubSpeed - 1.0) > 0.001)
         {
             var syncReset = new MenuItem { Header = "Reset Subtitle Sync (0.0s)" };
-            syncReset.Click += (_, _) => { _engine.ResetSubDelay(); ShowOsd("Subtitle Sync 0.0s"); };
+            syncReset.Click += (_, _) =>
+            {
+                _engine.ResetSubDelay();
+                SetSubSyncButtonState(SubSyncUiState.Idle);
+                ShowOsd("Subtitle Sync 0.0s");
+            };
             menu.Items.Add(syncReset);
         }
 
@@ -1237,6 +1326,19 @@ public partial class MainWindow : Window
         menu.Items.Add(openU);
 
         menu.Items.Add(new Separator());
+
+        var checkSubSync = new MenuItem { Header = "Check & Sync Subtitle with Audio", InputGestureText = "Y" };
+        checkSubSync.Click += (_, _) => _ = RunSubtitleSyncCheckAsync(isManual: true);
+        menu.Items.Add(checkSubSync);
+
+        var autoSyncOpt = new MenuItem
+        {
+            Header = "Auto-Sync Subtitles on Every Video",
+            IsCheckable = true,
+            IsChecked = _state.AutoSyncSubtitles
+        };
+        autoSyncOpt.Click += (_, _) => ToggleAutoSync();
+        menu.Items.Add(autoSyncOpt);
 
         var searchSub = new MenuItem { Header = "Search Subtitles Online...", InputGestureText = "D" };
         searchSub.Click += (_, _) => OpenSubtitleSearchModal();
@@ -1326,6 +1428,24 @@ public partial class MainWindow : Window
             {
                 _engine.ResetSubDelay();
                 _engine.AddExternalSubtitle(dlg.DownloadedSubtitlePath);
+
+                // SubtitleSearchWindow already audio-synced this file on disk; cache (0s, 1x) so Auto-Sync skips redundant re-scan
+                if (!string.IsNullOrWhiteSpace(currentPath) && File.Exists(currentPath) && File.Exists(dlg.DownloadedSubtitlePath))
+                {
+                    int aid = _engine.GetActiveAudioTrack()?.Id ?? 0;
+                    var pseudoTrack = new MediaTrack
+                    {
+                        Type = "sub",
+                        External = true,
+                        ExternalFilename = dlg.DownloadedSubtitlePath,
+                        Selected = true
+                    };
+                    string key = SubtitleAutoSyncService.BuildTrackCacheKey(currentPath, pseudoTrack, aid);
+                    _lastCheckedSubKey = key;
+                    _state.SubtitleSyncCache[key] = new SavedSubtitleSync { OffsetSeconds = 0, SpeedScale = 1.0, ConfidenceZ = 10.0 };
+                    StateStore.Save(_state);
+                    SetSubSyncButtonState(SubSyncUiState.InSync);
+                }
             }
             string detail = !string.IsNullOrWhiteSpace(dlg.SyncSummaryNote)
                 ? dlg.SyncSummaryNote
@@ -1336,6 +1456,286 @@ public partial class MainWindow : Window
         {
             _state.PreferredSubLang = dlg.SelectedLanguageCode;
             StateStore.Save(_state);
+        }
+    }
+
+    // ==================== PER-VIDEO AUDIO-TO-SUBTITLE SYNC CHECK & AUTO-SYNC ====================
+
+    private enum SubSyncUiState { Idle, Checking, InSync, Synced, Uncertain }
+
+    private void CheckSubSync_Click(object sender, RoutedEventArgs e)
+        => _ = RunSubtitleSyncCheckAsync(isManual: true);
+
+    private void ToggleAutoSync_Click(object sender, RoutedEventArgs e) => ToggleAutoSync();
+
+    private void ToggleAutoSync()
+    {
+        _state.AutoSyncSubtitles = !_state.AutoSyncSubtitles;
+        StateStore.Save(_state);
+        UpdateAutoSyncBadge(_state.AutoSyncSubtitles);
+
+        ShowOsd(_state.AutoSyncSubtitles ? "Auto-Sync Subtitles: ON" : "Auto-Sync Subtitles: OFF",
+                _state.AutoSyncSubtitles ? "Automatically checks & syncs every video" : "Click Sync Check or press Y manually");
+
+        if (_state.AutoSyncSubtitles && _engine.HasMedia && !_isSubSyncChecking)
+            _ = RunSubtitleSyncCheckAsync(isManual: false);
+    }
+
+    private void UpdateAutoSyncBadge(bool enabled)
+    {
+        if (enabled)
+        {
+            AutoSyncBadgeText.Text = "Auto: ON";
+            AutoSyncBadgeBtn.Background = new SolidColorBrush(Color.FromRgb(0x0F, 0x24, 0x19));
+            AutoSyncBadgeBtn.BorderBrush = new SolidColorBrush(Color.FromRgb(0x26, 0x5C, 0x3E));
+            AutoSyncBadgeBtn.Foreground = new SolidColorBrush(Color.FromRgb(0x4A, 0xDE, 0x80));
+        }
+        else
+        {
+            AutoSyncBadgeText.Text = "Auto: OFF";
+            AutoSyncBadgeBtn.Background = new SolidColorBrush(Color.FromRgb(0x15, 0x1B, 0x2A));
+            AutoSyncBadgeBtn.BorderBrush = new SolidColorBrush(Color.FromRgb(0x25, 0x2F, 0x47));
+            AutoSyncBadgeBtn.Foreground = new SolidColorBrush(Color.FromRgb(0x64, 0x74, 0x8B));
+        }
+    }
+
+    private void SetSubSyncButtonState(SubSyncUiState state, double offsetSeconds = 0)
+    {
+        switch (state)
+        {
+            case SubSyncUiState.Checking:
+                SubSyncBtnText.Text = "Checking...";
+                SubSyncBtn.Background = new SolidColorBrush(Color.FromRgb(0x0F, 0x21, 0x30));
+                SubSyncBtn.BorderBrush = new SolidColorBrush(Color.FromRgb(0x26, 0x5D, 0x82));
+                SubSyncBtn.Foreground = new SolidColorBrush(Color.FromRgb(0x38, 0xBD, 0xF8));
+                break;
+
+            case SubSyncUiState.InSync:
+                SubSyncBtnText.Text = "In Sync ✓";
+                SubSyncBtn.Background = new SolidColorBrush(Color.FromRgb(0x0F, 0x24, 0x19));
+                SubSyncBtn.BorderBrush = new SolidColorBrush(Color.FromRgb(0x26, 0x5C, 0x3E));
+                SubSyncBtn.Foreground = new SolidColorBrush(Color.FromRgb(0x4A, 0xDE, 0x80));
+                break;
+
+            case SubSyncUiState.Synced:
+                SubSyncBtnText.Text = $"Sync {offsetSeconds:+0.0;-0.0;0.0}s ✓";
+                SubSyncBtn.Background = new SolidColorBrush(Color.FromRgb(0x0F, 0x24, 0x19));
+                SubSyncBtn.BorderBrush = new SolidColorBrush(Color.FromRgb(0x26, 0x5C, 0x3E));
+                SubSyncBtn.Foreground = new SolidColorBrush(Color.FromRgb(0x4A, 0xDE, 0x80));
+                break;
+
+            case SubSyncUiState.Uncertain:
+                SubSyncBtnText.Text = "Sync ⚠";
+                SubSyncBtn.Background = new SolidColorBrush(Color.FromRgb(0x24, 0x1D, 0x10));
+                SubSyncBtn.BorderBrush = new SolidColorBrush(Color.FromRgb(0x6B, 0x4E, 0x22));
+                SubSyncBtn.Foreground = new SolidColorBrush(Color.FromRgb(0xFB, 0xBF, 0x24));
+                break;
+
+            default:
+                SubSyncBtnText.Text = "Sync Check";
+                SubSyncBtn.Background = new SolidColorBrush(Color.FromRgb(0x15, 0x1B, 0x2A));
+                SubSyncBtn.BorderBrush = new SolidColorBrush(Color.FromRgb(0x25, 0x2F, 0x47));
+                SubSyncBtn.Foreground = new SolidColorBrush(Color.FromRgb(0xCB, 0xD5, 0xE1));
+                break;
+        }
+    }
+
+    private void ScheduleAutoSubSync()
+    {
+        _autoSyncDebounceTimer.Stop();
+        _autoSyncDebounceTimer.Start();
+    }
+
+    private void CancelSubtitleSyncCheck(bool resetBadge)
+    {
+        _autoSyncDebounceTimer.Stop();
+        var old = _subSyncCts;
+        _subSyncCts = null;
+        _isSubSyncChecking = false;
+        try { old?.Cancel(); } catch { }
+        if (resetBadge)
+            SetSubSyncButtonState(SubSyncUiState.Idle);
+    }
+
+    private async Task RunSubtitleSyncCheckAsync(bool isManual)
+    {
+        if (_isSubSyncChecking)
+        {
+            if (isManual)
+            {
+                CancelSubtitleSyncCheck(resetBadge: true);
+                ShowOsd("Sync Check Cancelled");
+                return;
+            }
+            CancelSubtitleSyncCheck(resetBadge: false);
+        }
+
+        if (!_engine.HasMedia || _currentIndex < 0 || _currentIndex >= _playlist.Count)
+        {
+            if (isManual) ShowOsd("Open a Video First", "Play a local video with subtitles");
+            return;
+        }
+
+        var item = _playlist[_currentIndex];
+        if (item.IsStream || !File.Exists(item.Path))
+        {
+            if (isManual) ShowOsd("Local Videos Only", "Audio sync requires a local video file");
+            return;
+        }
+
+        if (!_engine.HasVideo && IsAudioOnlyExtension(item.Path))
+        {
+            if (isManual) ShowOsd("Video Required", "Audio-only files have no subtitles");
+            return;
+        }
+
+        var activeSub = _engine.GetActiveSubtitleTrack();
+        if (activeSub == null)
+        {
+            SetSubSyncButtonState(SubSyncUiState.Idle);
+            if (isManual) ShowOsd("No Subtitle Active", "Press D to search online or drop an .srt file", durationMs: 2400);
+            return;
+        }
+
+        int activeAudioId = _engine.GetActiveAudioTrack()?.Id ?? 0;
+        string cacheKey = SubtitleAutoSyncService.BuildTrackCacheKey(item.Path, activeSub, activeAudioId);
+
+        if (!isManual)
+        {
+            if (string.Equals(_lastCheckedSubKey, cacheKey, StringComparison.Ordinal))
+                return;
+
+            if (_state.SubtitleSyncCache.TryGetValue(cacheKey, out var cached))
+            {
+                _lastCheckedSubKey = cacheKey;
+                _engine.SetSubSync(cached.OffsetSeconds, cached.SpeedScale);
+                bool hasShift = Math.Abs(cached.OffsetSeconds) >= 0.25 || Math.Abs(cached.SpeedScale - 1.0) > 0.001;
+                SetSubSyncButtonState(hasShift ? SubSyncUiState.Synced : SubSyncUiState.InSync, cached.OffsetSeconds);
+                if (hasShift)
+                    ShowOsd("Subtitle Sync Restored ✓", $"Offset {cached.OffsetSeconds:+0.0;-0.0;0.0}s (cached)", durationMs: 1800);
+                return;
+            }
+        }
+
+        _lastCheckedSubKey = cacheKey;
+        var cts = new CancellationTokenSource();
+        _subSyncCts = cts;
+        var ct = cts.Token;
+        _isSubSyncChecking = true;
+
+        SetSubSyncButtonState(SubSyncUiState.Checking);
+        if (isManual)
+            ShowOsd("Checking Subtitle Sync...", "Analyzing speech audio (3–5s)", durationMs: 2500);
+
+        string capturedVideoPath = item.Path;
+        int capturedSubId = activeSub.Id;
+        string capturedSubFile = activeSub.ExternalFilename;
+
+        try
+        {
+            var result = await SubtitleAutoSyncService.AnalyzeActiveTrackAsync(
+                capturedVideoPath,
+                _engine.Duration,
+                activeSub,
+                activeAudioId,
+                statusProgress: null,
+                ct);
+
+            if (ct.IsCancellationRequested) return;
+
+            // Ensure user didn't switch videos or subtitle tracks while analyzing in background
+            bool stillSameMedia = _engine.HasMedia
+                               && _currentIndex >= 0 && _currentIndex < _playlist.Count
+                               && string.Equals(_playlist[_currentIndex].Path, capturedVideoPath, StringComparison.OrdinalIgnoreCase);
+            var currentSub = stillSameMedia ? _engine.GetActiveSubtitleTrack() : null;
+            bool stillSameSub = currentSub != null
+                             && currentSub.Id == capturedSubId
+                             && string.Equals(currentSub.ExternalFilename, capturedSubFile, StringComparison.OrdinalIgnoreCase);
+
+            if (!stillSameMedia || !stillSameSub)
+                return;
+
+            if (result.Succeeded)
+            {
+                _engine.SetSubSync(result.OffsetSeconds, result.SpeedScale);
+                _state.SubtitleSyncCache[cacheKey] = new SavedSubtitleSync
+                {
+                    OffsetSeconds = result.OffsetSeconds,
+                    SpeedScale = result.SpeedScale,
+                    ConfidenceZ = result.ConfidenceZ
+                };
+                StateStore.Save(_state);
+
+                if (result.WasModified)
+                {
+                    SetSubSyncButtonState(SubSyncUiState.Synced, result.OffsetSeconds);
+                    ShowOsd(isManual ? "Subtitle Synced ✓" : "Auto-Synced Subtitle ✓", result.Summary, durationMs: 3000);
+                }
+                else
+                {
+                    SetSubSyncButtonState(SubSyncUiState.InSync);
+                    ShowOsd("Subtitle Already in Sync ✓", result.Summary, durationMs: isManual ? 2400 : 1600);
+                }
+            }
+            else
+            {
+                SetSubSyncButtonState(isManual ? SubSyncUiState.Uncertain : SubSyncUiState.Idle);
+                if (isManual)
+                    ShowOsd("Sync Check Uncertain", result.Summary, durationMs: 2800);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancelled cleanly on video switch / stop / manual cancel
+        }
+        catch (Exception ex)
+        {
+            if (!ct.IsCancellationRequested)
+            {
+                SetSubSyncButtonState(isManual ? SubSyncUiState.Uncertain : SubSyncUiState.Idle);
+                if (isManual)
+                    ShowOsd("Sync Check Failed", ex.Message, durationMs: 2800);
+            }
+        }
+        finally
+        {
+            if (ReferenceEquals(_subSyncCts, cts))
+            {
+                _isSubSyncChecking = false;
+                _subSyncCts = null;
+            }
+            cts.Dispose();
+        }
+    }
+
+    private void SaveCurrentSyncToSrt()
+    {
+        if (!_engine.HasMedia || _currentIndex < 0 || _currentIndex >= _playlist.Count) return;
+        var activeSub = _engine.GetActiveSubtitleTrack();
+        if (activeSub is not { External: true } || string.IsNullOrWhiteSpace(activeSub.ExternalFilename) || !File.Exists(activeSub.ExternalFilename))
+        {
+            ShowOsd("External .srt Required", "Embedded tracks use live sync automatically");
+            return;
+        }
+
+        try
+        {
+            SubtitleAutoSyncService.SaveSyncedSrtFile(activeSub.ExternalFilename, _engine.SubSpeed, _engine.SubDelay);
+            _engine.ResetSubDelay();
+            _engine.ReloadExternalSubtitles();
+
+            int aid = _engine.GetActiveAudioTrack()?.Id ?? 0;
+            string newKey = SubtitleAutoSyncService.BuildTrackCacheKey(_playlist[_currentIndex].Path, activeSub, aid);
+            _lastCheckedSubKey = newKey;
+            _state.SubtitleSyncCache[newKey] = new SavedSubtitleSync { OffsetSeconds = 0, SpeedScale = 1.0, ConfidenceZ = 10.0 };
+            StateStore.Save(_state);
+
+            SetSubSyncButtonState(SubSyncUiState.InSync);
+            ShowOsd("Saved Sync to .srt ✓", Path.GetFileName(activeSub.ExternalFilename), durationMs: 2400);
+        }
+        catch (Exception ex)
+        {
+            ShowOsd("Could Not Save .srt", ex.Message, durationMs: 2800);
         }
     }
 
