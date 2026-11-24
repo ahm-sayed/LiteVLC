@@ -41,6 +41,7 @@ public sealed class MpvEngine : IDisposable
     public bool AudioBoostEnabled { get; private set; } = true;
     public double SubDelay { get; private set; }
     public bool HasMedia { get; private set; }
+    public bool HasVideo { get; private set; }
     public string CurrentTitle { get; private set; } = "";
     public double LastSeekMs { get; private set; }
 
@@ -56,6 +57,8 @@ public sealed class MpvEngine : IDisposable
     public event Action<double>? SpeedChanged;
     public event Action<string>? MediaTitleChanged;
     public event Action? FileLoaded;
+    public event Action<bool>? VideoOutputChanged;
+    public event Action? FileLoadFailed;
     public event Action<bool>? FileEnded; // true = normal EOF
     public event Action? TracksChanged;
     public event Action<double, double>? SeekPreview; // (accumulatedDelta, predictedPos)
@@ -629,18 +632,37 @@ public sealed class MpvEngine : IDisposable
                     break;
 
                 case MpvEventId.FileLoaded:
+                {
                     HasMedia = true;
+                    bool hasVid = GetInt64Property("width") > 0 && GetInt64Property("height") > 0;
+                    HasVideo = hasVid;
                     FileLoaded?.Invoke();
+                    VideoOutputChanged?.Invoke(hasVid);
                     TracksChanged?.Invoke();
                     break;
+                }
+
+                case MpvEventId.VideoReconfig:
+                {
+                    bool hasVid = GetInt64Property("width") > 0 && GetInt64Property("height") > 0;
+                    if (HasVideo != hasVid)
+                    {
+                        HasVideo = hasVid;
+                        VideoOutputChanged?.Invoke(hasVid);
+                    }
+                    break;
+                }
 
                 case MpvEventId.EndFile:
+                    HasVideo = false;
                     if (ev.Data != IntPtr.Zero)
                     {
                         var endData = Marshal.PtrToStructure<MpvEventEndFile>(ev.Data);
                         bool isEof = endData.Reason == MpvEndFileReason.Eof;
-                        if (endData.Reason == MpvEndFileReason.Stop)
+                        if (endData.Reason == MpvEndFileReason.Stop || endData.Reason == MpvEndFileReason.Error)
                             HasMedia = false;
+                        if (endData.Reason == MpvEndFileReason.Error)
+                            FileLoadFailed?.Invoke();
                         FileEnded?.Invoke(isEof);
                     }
                     break;

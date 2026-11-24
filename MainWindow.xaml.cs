@@ -331,14 +331,35 @@ public partial class MainWindow : Window
             {
                 TitleText.Text = title;
                 Title = $"{title} — LiteVLC";
+                AudioStageTitle.Text = title;
             }
         });
 
         _engine.FileLoaded += () => Dispatcher.BeginInvoke(() =>
         {
-            ShowVideoStage(true);
             SeekThumb.Visibility = Visibility.Visible;
             SyncOverlayBounds();
+        });
+
+        _engine.VideoOutputChanged += hasVideo => Dispatcher.BeginInvoke(() =>
+        {
+            if (!_engine.HasMedia) return;
+            if (hasVideo)
+            {
+                ShowStage(StageMode.Video);
+            }
+            else
+            {
+                AudioStageSubtitle.Text = "Audio Playback  •  WASAPI Hi-Fi";
+                ShowStage(StageMode.AudioOrLoading);
+            }
+            SyncOverlayBounds();
+        });
+
+        _engine.FileLoadFailed += () => Dispatcher.BeginInvoke(() =>
+        {
+            ShowStage(StageMode.Empty);
+            ShowOsd("Unable to Play File", "File missing or unsupported");
         });
 
         _engine.FileEnded += isEof => Dispatcher.BeginInvoke(() =>
@@ -403,7 +424,7 @@ public partial class MainWindow : Window
                 "LiteVLC Engine Error", MessageBoxButton.OK, MessageBoxImage.Error);
         }
 
-        ShowVideoStage(false);
+        ShowStage(StageMode.Empty);
 
         // Create click-through overlay & compact floating fullscreen controller WITHOUT showing them until needed
         // (keeps Windows DWM in pure DirectFlip with ZERO flicker during playback!)
@@ -478,11 +499,19 @@ public partial class MainWindow : Window
         catch { }
     }
 
-    private void ShowVideoStage(bool showVideo)
+    private enum StageMode { Empty, AudioOrLoading, Video }
+
+    private void ShowStage(StageMode mode)
     {
-        VideoHostSlot.Visibility = showVideo ? Visibility.Visible : Visibility.Collapsed;
-        EmptyStatePanel.Visibility = showVideo ? Visibility.Collapsed : Visibility.Visible;
-        if (!showVideo)
+        _videoHost.IsRenderingVideo = (mode == StageMode.Video);
+        VideoHostSlot.Visibility = mode == StageMode.Video ? Visibility.Visible : Visibility.Collapsed;
+        AudioStagePanel.Visibility = mode == StageMode.AudioOrLoading ? Visibility.Visible : Visibility.Collapsed;
+        EmptyStatePanel.Visibility = mode == StageMode.Empty ? Visibility.Visible : Visibility.Collapsed;
+
+        if (mode != StageMode.Video)
+            _videoHost.RepaintSolidBackground();
+
+        if (mode == StageMode.Empty)
         {
             TitleText.Text = "Ready • Direct3D 11 Engine";
             Title = "LiteVLC";
@@ -493,6 +522,20 @@ public partial class MainWindow : Window
             SeekLatencyBadge.Visibility = Visibility.Collapsed;
             RefreshRecentFilesUi();
         }
+    }
+
+    private static bool IsAudioOnlyExtension(string path)
+    {
+        string ext = Path.GetExtension(path);
+        return ext.Equals(".mp3", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".flac", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".wav", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".ogg", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".opus", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".aac", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".m4a", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".wma", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".alac", StringComparison.OrdinalIgnoreCase);
     }
 
     private void ShowOsd(string message, string? sub = null, int durationMs = 1150)
@@ -623,7 +666,12 @@ public partial class MainWindow : Window
             StateStore.Save(_state);
         }
 
-        ShowVideoStage(true);
+        AudioStageTitle.Text = item.Title;
+        AudioStageSubtitle.Text = IsAudioOnlyExtension(item.Path)
+            ? "Audio Playback  •  WASAPI Hi-Fi"
+            : "Loading Media...";
+        // Show solid dark Audio/Loading stage until libmpv confirms real video frames (eliminates transparent HWND!)
+        ShowStage(StageMode.AudioOrLoading);
         _engine.LoadFile(item.Path, resume);
         TitleText.Text = item.Title;
         Title = $"{item.Title} — LiteVLC";
@@ -1038,7 +1086,7 @@ public partial class MainWindow : Window
         SaveCurrentResumePosition();
         StateStore.Save(_state);
         _engine.Stop();
-        ShowVideoStage(false);
+        ShowStage(StageMode.Empty);
     }
 
     private void Mute_Click(object sender, RoutedEventArgs e)

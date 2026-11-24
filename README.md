@@ -8,7 +8,7 @@
 
 ## Download (Windows 10/11 64-bit)
 
-Download the latest standalone Windows Installer (**`LiteVLC-Setup-1.5.0.exe`** — includes .NET runtime & `libmpv-2.dll`, no extra setup needed) from the **[Releases](https://github.com/ahm-sayed/LiteVLC/releases/latest)** page.
+Download the latest standalone Windows Installer (**`LiteVLC-Setup-1.5.1.exe`** — includes .NET runtime & `libmpv-2.dll`, no extra setup needed) from the **[Releases](https://github.com/ahm-sayed/LiteVLC/releases/latest)** page.
 
 ---
 

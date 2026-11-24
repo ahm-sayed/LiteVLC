@@ -241,18 +241,50 @@
             </Border>
 
             <!-- ==================== MAIN VIDEO STAGE + ANIMATED PLAYLIST ==================== -->
-            <Grid Grid.Row="1" Background="#000000">
+            <Grid Grid.Row="1" Background="#080A0F">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
 
                 <!-- Native D3D11 Video Host Container -->
-                <Grid x:Name="StageContainer" Grid.Column="0" Background="#000000">
+                <Grid x:Name="StageContainer" Grid.Column="0" Background="#080A0F">
                     <ContentControl x:Name="VideoHostSlot"
                                     HorizontalContentAlignment="Stretch"
                                     VerticalContentAlignment="Stretch"
                                     Visibility="Collapsed"/>
+
+                    <!-- Solid Dark Audio / Now-Playing Stage (prevents transparent HWND when playing MP3/FLAC or loading) -->
+                    <Grid x:Name="AudioStagePanel" Visibility="Collapsed">
+                        <Grid.Background>
+                            <RadialGradientBrush Center="0.5,0.45" GradientOrigin="0.5,0.45" RadiusX="0.55" RadiusY="0.6">
+                                <GradientStop Color="#161D30" Offset="0"/>
+                                <GradientStop Color="#080A0F" Offset="1"/>
+                            </RadialGradientBrush>
+                        </Grid.Background>
+                        <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" MaxWidth="520">
+                            <Border Width="116" Height="116" CornerRadius="58" Background="#121828" BorderBrush="#44FF6B2B" BorderThickness="1.5" HorizontalAlignment="Center" Margin="0,0,0,22">
+                                <Border.Effect>
+                                    <DropShadowEffect Color="#FF6B2B" BlurRadius="34" ShadowDepth="0" Opacity="0.28"/>
+                                </Border.Effect>
+                                <Image Source="pack://application:,,,/Assets/LiteVLC.png" Width="62" Height="62" RenderOptions.BitmapScalingMode="HighQuality"/>
+                            </Border>
+                            <TextBlock x:Name="AudioStageTitle"
+                                       Text="Now Playing"
+                                       Foreground="#F8FAFC"
+                                       FontSize="20"
+                                       FontWeight="SemiBold"
+                                       TextTrimming="CharacterEllipsis"
+                                       TextAlignment="Center"
+                                       HorizontalAlignment="Center"/>
+                            <TextBlock x:Name="AudioStageSubtitle"
+                                       Text="Audio Playback  •  WASAPI Hi-Fi"
+                                       Foreground="#94A3B8"
+                                       FontSize="12.5"
+                                       Margin="0,6,0,0"
+                                       HorizontalAlignment="Center"/>
+                        </StackPanel>
+                    </Grid>
 
                     <!-- Polished Cinema Empty State / Drop Zone -->
                     <Grid x:Name="EmptyStatePanel">

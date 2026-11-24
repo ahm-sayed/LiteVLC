@@ -16,12 +16,19 @@ public sealed class VideoHost : HwndHost
     private IntPtr _hwnd;
     private string? _windowClassName;
     private IntPtr _arrowCursor;
+    private IntPtr _bgBrush;
     private bool _cursorHidden;
     private bool _hasLastCursor;
     private int _lastCursorX;
     private int _lastCursorY;
 
     public IntPtr VideoHandle => _hwnd;
+
+    /// <summary>
+    /// True only while libmpv is actively presenting D3D11 video frames.
+    /// When false (idle, loading, audio-only), WM_ERASEBKGND paints solid dark #090B10 so the HWND is NEVER transparent!
+    /// </summary>
+    public bool IsRenderingVideo { get; set; }
 
     public event Action? VideoDoubleClicked;
     public event Action? VideoSingleClicked;
@@ -54,6 +61,12 @@ public sealed class VideoHost : HwndHost
     {
         public int X;
         public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left, Top, Right, Bottom;
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -100,6 +113,21 @@ public sealed class VideoHost : HwndHost
     [DllImport("user32.dll")]
     private static extern bool GetCursorPos(out POINT lpPoint);
 
+    [DllImport("user32.dll")]
+    private static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll")]
+    private static extern int FillRect(IntPtr hDC, ref RECT lprc, IntPtr hbr);
+
+    [DllImport("user32.dll")]
+    private static extern bool InvalidateRect(IntPtr hWnd, IntPtr lpRect, bool bErase);
+
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr CreateSolidBrush(uint crColor);
+
+    [DllImport("gdi32.dll")]
+    private static extern bool DeleteObject(IntPtr hObject);
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr GetModuleHandleW(string? lpModuleName);
 
@@ -140,6 +168,7 @@ public sealed class VideoHost : HwndHost
         _windowClassName = $"LiteVLC_VideoHost_{Guid.NewGuid():N}";
         _wndProcDelegate = CustomWndProc;
         _arrowCursor = LoadCursorW(IntPtr.Zero, (IntPtr)32512); // IDC_ARROW
+        _bgBrush = CreateSolidBrush(0x000F0A08); // Solid obsidian #080A0F (COLORREF is 0x00BBGGRR)
 
         var wc = new WNDCLASSEX
         {
@@ -148,7 +177,7 @@ public sealed class VideoHost : HwndHost
             lpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProcDelegate),
             hInstance = hInstance,
             hCursor = _arrowCursor,
-            hbrBackground = IntPtr.Zero, // Never GDI-erase over D3D11 SwapChain (prevents periodic flicker)
+            hbrBackground = _bgBrush,
             lpszClassName = _windowClassName
         };
 
@@ -176,11 +205,19 @@ public sealed class VideoHost : HwndHost
         return new HandleRef(this, _hwnd);
     }
 
+    public void RepaintSolidBackground()
+    {
+        if (_hwnd != IntPtr.Zero && !IsRenderingVideo)
+            InvalidateRect(_hwnd, IntPtr.Zero, true);
+    }
+
     private IntPtr CustomWndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
     {
         switch (msg)
         {
             case WM_ERASEBKGND:
+                if (!IsRenderingVideo && _bgBrush != IntPtr.Zero && GetClientRect(hWnd, out RECT rc))
+                    FillRect(wParam, ref rc, _bgBrush);
                 return (IntPtr)1;
 
             case WM_SETCURSOR:
@@ -267,6 +304,11 @@ public sealed class VideoHost : HwndHost
             DestroyWindow(hwnd.Handle);
         if (!string.IsNullOrEmpty(_windowClassName))
             UnregisterClassW(_windowClassName, GetModuleHandleW(null));
+        if (_bgBrush != IntPtr.Zero)
+        {
+            DeleteObject(_bgBrush);
+            _bgBrush = IntPtr.Zero;
+        }
         _hwnd = IntPtr.Zero;
     }
 }
