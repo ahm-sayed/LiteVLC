@@ -241,6 +241,7 @@ public partial class MainWindow : Window
         UpdateAudioBoostBadge(_state.AudioBoost);
         UpdateAutoSyncBadge(_state.AutoSyncSubtitles);
         SetSubSyncButtonState(SubSyncUiState.Idle);
+        UpdateBtn.ToolTip = $"LiteVLC v{AutoUpdaterService.GetCurrentVersion()} — Check for Updates on GitHub";
         RefreshRecentFilesUi();
     }
 
@@ -2116,10 +2117,11 @@ public partial class MainWindow : Window
 
     private void OpenUpdateDialog()
     {
-        var dlg = new UpdateDialog(_cachedUpdateResult is { UpdateAvailable: true } ? _cachedUpdateResult : null) { Owner = this };
+        // Always perform a fresh live check so updates always jump straight to the absolute latest release
+        var dlg = new UpdateDialog(null) { Owner = this };
         if (dlg.ShowDialog() == true && dlg.UpdateLaunched)
         {
-            // Close immediately so silent Inno Setup replaces the app and relaunches it cleanly!
+            // Close immediately so silent Inno Setup replaces the app in-place and relaunches the new version cleanly!
             Application.Current.Shutdown();
         }
     }

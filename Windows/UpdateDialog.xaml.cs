@@ -22,12 +22,13 @@ public partial class UpdateDialog : Window
         _result = preloaded;
         InitializeComponent();
 
+        // Always perform a fresh live check against GitHub so clicking Update ALWAYS jumps
+        // straight to the absolute newest version (never a stale cached startup result!).
         Loaded += async (_, _) =>
         {
             if (_result != null)
                 ApplyCheckResult(_result);
-            else
-                await CheckNowAsync();
+            await CheckNowAsync();
         };
     }
 
