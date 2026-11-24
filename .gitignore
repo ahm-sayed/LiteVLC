@@ -1,0 +1,10 @@
+bin/
+obj/
+publish/
+dist/
+.vs/
+*.user
+*.suo
+native/libmpv-2.dll
+native/mpv-dev.7z
+native/include/

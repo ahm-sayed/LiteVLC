@@ -1,0 +1,698 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text.Json;
+using System.Threading;
+using LiteVLC.Models;
+
+namespace LiteVLC.Engine;
+
+public sealed class MpvEngine : IDisposable
+{
+    private IntPtr _handle;
+    private Thread? _eventThread;
+    private volatile bool _running;
+    private volatile bool _disposed;
+    private readonly object _lock = new();
+
+    // Seek coalescing state (eliminates decoder thrashing on rapid +10s taps)
+    private readonly object _seekLock = new();
+    private double _pendingSeekDelta;
+    private double _seekBaselineTime;
+    private bool _hasPendingSeek;
+    private readonly Timer _seekCoalesceTimer;
+    private long _seekStartTicks;
+
+    // Live cached playback state
+    public double Position { get; private set; }
+    public double Duration { get; private set; }
+    public double CacheDuration { get; private set; }
+    public bool IsPaused { get; private set; } = true;
+    public bool IsMuted { get; private set; }
+    public double Volume { get; private set; } = 100;
+    public double Speed { get; private set; } = 1.0;
+    public bool FastSeekEnabled { get; private set; } = true;
+    public bool AudioBoostEnabled { get; private set; } = true;
+    public double SubDelay { get; private set; }
+    public bool HasMedia { get; private set; }
+    public string CurrentTitle { get; private set; } = "";
+    public double LastSeekMs { get; private set; }
+
+    public string ScreenshotDirectory { get; }
+
+    // Events (invoked from event pump thread — UI marshals via Dispatcher)
+    public event Action<double>? PositionChanged;
+    public event Action<double>? DurationChanged;
+    public event Action<double>? CacheDurationChanged;
+    public event Action<bool>? PauseChanged;
+    public event Action<double>? VolumeChanged;
+    public event Action<bool>? MuteChanged;
+    public event Action<double>? SpeedChanged;
+    public event Action<string>? MediaTitleChanged;
+    public event Action? FileLoaded;
+    public event Action<bool>? FileEnded; // true = normal EOF
+    public event Action? TracksChanged;
+    public event Action<double, double>? SeekPreview; // (accumulatedDelta, predictedPos)
+    public event Action<double>? SeekCompleted; // elapsedMs
+
+    private const ulong PropTimePos = 1;
+    private const ulong PropDuration = 2;
+    private const ulong PropPause = 3;
+    private const ulong PropVolume = 4;
+    private const ulong PropMute = 5;
+    private const ulong PropSpeed = 6;
+    private const ulong PropMediaTitle = 7;
+    private const ulong PropCacheDuration = 8;
+    private const ulong PropTrackListCount = 9;
+
+    public MpvEngine()
+    {
+        ScreenshotDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
+            "LiteVLC");
+        Directory.CreateDirectory(ScreenshotDirectory);
+
+        _seekCoalesceTimer = new Timer(_ => FlushPendingSeek(), null, Timeout.Infinite, Timeout.Infinite);
+    }
+
+    public void Initialize(IntPtr hwnd, double initialVolume = 100, bool fastSeek = true, bool audioBoost = true)
+    {
+        lock (_lock)
+        {
+            if (_handle != IntPtr.Zero) return;
+
+            _handle = MpvNative.mpv_create();
+            if (_handle == IntPtr.Zero)
+                throw new InvalidOperationException("Failed to create libmpv instance. Ensure libmpv-2.dll is present.");
+
+            FastSeekEnabled = fastSeek;
+            AudioBoostEnabled = audioBoost;
+            Volume = Math.Clamp(initialVolume, 0, 200);
+
+            // Bind directly to Win32 HWND for zero-copy hardware rendering
+            long wid = hwnd.ToInt64();
+            Check(MpvNative.mpv_set_option(_handle, "wid", MpvFormat.Int64, ref wid), "wid");
+
+            // --- Core Performance & Zero-Lag / Zero-Flicker Profile ---
+            SetOpt("vo", "gpu");
+            SetOpt("gpu-api", "d3d11");
+            SetOpt("d3d11-flip", "yes");
+            SetOpt("d3d11-sync-refresh", "no");
+            SetOpt("framedrop", "vo");
+            SetOpt("hwdec", "auto-safe");
+            SetOpt("hwdec-codecs", "all");
+
+            // Loud, clear VLC-parity WASAPI audio (fixes quiet 5.1->stereo downmix & ReplayGain attenuation)
+            SetOpt("ao", "wasapi");
+            SetOpt("audio-stream-silence", "yes");
+            SetOpt("video-sync", "audio");
+            SetOpt("audio-pitch-correction", "yes");
+            SetOpt("audio-normalize-downmix", "yes");
+            SetOpt("ad-lavc-downmix", "yes");
+            SetOpt("replaygain", "no");
+            SetOpt("volume-max", "200");
+            SetOpt("volume-gain", audioBoost ? "6.0" : "4.5");
+            if (audioBoost)
+                SetOpt("af", "lavfi=[dynaudnorm=f=150:g=15:p=0.92:m=8]");
+
+            // Smart RAM demuxer cache (forward + backward) so ±10s seeks hit RAM instantly while keeping RAM lean
+            SetOpt("cache", "yes");
+            SetOpt("demuxer-max-bytes", "48MiB");
+            SetOpt("demuxer-max-back-bytes", "20MiB");
+            SetOpt("demuxer-readahead-secs", "15");
+
+            // Keyframe fast seeking by default (zero intermediate-frame stall)
+            SetOpt("hr-seek", fastSeek ? "no" : "yes");
+            SetOpt("hr-seek-framedrop", "yes");
+
+            // Clean embedded behavior (we provide our own sleek WPF UI + OSD)
+            SetOpt("idle", "yes");
+            SetOpt("keep-open", "yes");
+            SetOpt("osc", "no");
+            SetOpt("osd-level", "0");
+            SetOpt("input-default-bindings", "no");
+            SetOpt("input-vo-keyboard", "no");
+            SetOpt("cursor-autohide", "no");
+
+            // VLC-parity features: volume up to 200%, fuzzy subtitle loading, clean subtitle styling
+            SetOpt("volume", Volume.ToString(CultureInfo.InvariantCulture));
+            SetOpt("sub-auto", "fuzzy");
+            SetOpt("sub-font", "Segoe UI");
+            SetOpt("sub-font-size", "44");
+            SetOpt("sub-margin-y", "38");
+            SetOpt("sub-border-size", "2.5");
+            SetOpt("sub-shadow-offset", "1");
+            SetOpt("sub-codepage", "auto");
+            SetOpt("screenshot-directory", ScreenshotDirectory);
+            SetOpt("screenshot-format", "png");
+            SetOpt("screenshot-template", "LiteVLC_%F_%P");
+
+            // Avoid heavy unnecessary startup probes
+            SetOpt("config", "no");
+            SetOpt("load-scripts", "no");
+            SetOpt("ytdl", "no");
+
+            Check(MpvNative.mpv_initialize(_handle), "mpv_initialize");
+
+            // Observe essential properties reactively (no UI polling!)
+            MpvNative.mpv_observe_property(_handle, PropTimePos, "time-pos", MpvFormat.Double);
+            MpvNative.mpv_observe_property(_handle, PropDuration, "duration", MpvFormat.Double);
+            MpvNative.mpv_observe_property(_handle, PropPause, "pause", MpvFormat.Flag);
+            MpvNative.mpv_observe_property(_handle, PropVolume, "volume", MpvFormat.Double);
+            MpvNative.mpv_observe_property(_handle, PropMute, "mute", MpvFormat.Flag);
+            MpvNative.mpv_observe_property(_handle, PropSpeed, "speed", MpvFormat.Double);
+            MpvNative.mpv_observe_property(_handle, PropMediaTitle, "media-title", MpvFormat.String);
+            MpvNative.mpv_observe_property(_handle, PropCacheDuration, "demuxer-cache-duration", MpvFormat.Double);
+            MpvNative.mpv_observe_property(_handle, PropTrackListCount, "track-list/count", MpvFormat.Int64);
+
+            _running = true;
+            _eventThread = new Thread(EventLoop)
+            {
+                Name = "LiteVLC-MpvEventPump",
+                IsBackground = true
+            };
+            _eventThread.Start();
+        }
+    }
+
+    private void SetOpt(string name, string value)
+    {
+        if (_handle == IntPtr.Zero) return;
+        MpvNative.mpv_set_option_string(_handle, name, value);
+    }
+
+    private static void Check(int status, string context)
+    {
+        if (status < 0)
+            throw new InvalidOperationException($"{context} failed: {MpvNative.GetErrorMessage(status)}");
+    }
+
+    public void LoadFile(string path, double? resumeSeconds = null)
+    {
+        if (_handle == IntPtr.Zero || string.IsNullOrWhiteSpace(path)) return;
+        CancelPendingSeek();
+        HasMedia = true;
+
+        if (resumeSeconds is > 2.0)
+        {
+            string startOpt = $"start={resumeSeconds.Value.ToString("0.###", CultureInfo.InvariantCulture)}";
+            MpvNative.CommandUtf8(_handle, true, "loadfile", path, "replace", "-1", startOpt);
+        }
+        else
+        {
+            MpvNative.CommandUtf8(_handle, true, "loadfile", path, "replace");
+        }
+        SetPause(false);
+    }
+
+    public void Stop()
+    {
+        if (_handle == IntPtr.Zero) return;
+        CancelPendingSeek();
+        HasMedia = false;
+        Position = 0;
+        Duration = 0;
+        CacheDuration = 0;
+        MpvNative.CommandUtf8(_handle, true, "stop");
+    }
+
+    public void TogglePause()
+    {
+        if (_handle == IntPtr.Zero || !HasMedia) return;
+        SetPause(!IsPaused);
+    }
+
+    public void SetPause(bool paused)
+    {
+        if (_handle == IntPtr.Zero) return;
+        int flag = paused ? 1 : 0;
+        MpvNative.mpv_set_property(_handle, "pause", MpvFormat.Flag, ref flag);
+    }
+
+    /// <summary>
+    /// Zero-lag coalesced relative seek (e.g. +10s / -10s).
+    /// Rapid keypresses accumulate cleanly within 55ms into one fast keyframe seek.
+    /// </summary>
+    public void SeekRelative(double deltaSeconds)
+    {
+        if (_handle == IntPtr.Zero || !HasMedia) return;
+
+        double accumulated;
+        double predicted;
+        lock (_seekLock)
+        {
+            if (!_hasPendingSeek)
+            {
+                _seekBaselineTime = Position;
+                _pendingSeekDelta = 0;
+                _hasPendingSeek = true;
+            }
+            _pendingSeekDelta += deltaSeconds;
+            accumulated = _pendingSeekDelta;
+            predicted = Duration > 0
+                ? Math.Clamp(_seekBaselineTime + accumulated, 0, Duration)
+                : Math.Max(0, _seekBaselineTime + accumulated);
+
+            // Coalesce rapid consecutive taps into one clean seek
+            _seekCoalesceTimer.Change(55, Timeout.Infinite);
+        }
+
+        SeekPreview?.Invoke(accumulated, predicted);
+    }
+
+    private void FlushPendingSeek()
+    {
+        double delta;
+        lock (_seekLock)
+        {
+            if (!_hasPendingSeek || _disposed || _handle == IntPtr.Zero) return;
+            delta = _pendingSeekDelta;
+            _pendingSeekDelta = 0;
+            _hasPendingSeek = false;
+        }
+
+        if (Math.Abs(delta) < 0.001) return;
+
+        Interlocked.Exchange(ref _seekStartTicks, Stopwatch.GetTimestamp());
+        string mode = FastSeekEnabled ? "relative+keyframes" : "relative+exact";
+        MpvNative.CommandUtf8(_handle, true, "seek", delta.ToString("0.###", CultureInfo.InvariantCulture), mode);
+    }
+
+    private void CancelPendingSeek()
+    {
+        lock (_seekLock)
+        {
+            _seekCoalesceTimer.Change(Timeout.Infinite, Timeout.Infinite);
+            _pendingSeekDelta = 0;
+            _hasPendingSeek = false;
+        }
+    }
+
+    /// <summary>
+    /// Direct absolute seek (used by timeline slider click/drag).
+    /// </summary>
+    public void SeekAbsolute(double targetSeconds, bool forceFast = false)
+    {
+        if (_handle == IntPtr.Zero || !HasMedia) return;
+        CancelPendingSeek();
+        double clamped = Duration > 0 ? Math.Clamp(targetSeconds, 0, Duration) : Math.Max(0, targetSeconds);
+        Interlocked.Exchange(ref _seekStartTicks, Stopwatch.GetTimestamp());
+        string mode = (forceFast || FastSeekEnabled) ? "absolute+keyframes" : "absolute+exact";
+        MpvNative.CommandUtf8(_handle, true, "seek", clamped.ToString("0.###", CultureInfo.InvariantCulture), mode);
+    }
+
+    public void FrameStep()
+    {
+        if (_handle == IntPtr.Zero || !HasMedia) return;
+        MpvNative.CommandUtf8(_handle, true, "frame-step");
+    }
+
+    public void FrameBackStep()
+    {
+        if (_handle == IntPtr.Zero || !HasMedia) return;
+        MpvNative.CommandUtf8(_handle, true, "frame-back-step");
+    }
+
+    public void SetFastSeek(bool enabled)
+    {
+        FastSeekEnabled = enabled;
+        if (_handle == IntPtr.Zero) return;
+        MpvNative.mpv_set_property_string(_handle, "hr-seek", enabled ? "no" : "yes");
+    }
+
+    public void SetVolume(double volume)
+    {
+        double clamped = Math.Clamp(volume, 0, 200);
+        Volume = clamped;
+        if (_handle == IntPtr.Zero) return;
+        MpvNative.mpv_set_property_async(_handle, 0, "volume", MpvFormat.Double, ref clamped);
+    }
+
+    public void SetAudioBoost(bool enabled)
+    {
+        AudioBoostEnabled = enabled;
+        if (_handle == IntPtr.Zero) return;
+        MpvNative.mpv_set_property_string(_handle, "volume-gain", enabled ? "6.0" : "4.5");
+        MpvNative.mpv_set_property_string(_handle, "af", enabled ? "lavfi=[dynaudnorm=f=150:g=15:p=0.92:m=8]" : "");
+    }
+
+    public double AdjustSubDelay(double deltaSeconds)
+    {
+        SubDelay = Math.Round(SubDelay + deltaSeconds, 2);
+        if (_handle != IntPtr.Zero)
+        {
+            double val = SubDelay;
+            MpvNative.mpv_set_property(_handle, "sub-delay", MpvFormat.Double, ref val);
+        }
+        return SubDelay;
+    }
+
+    public void ResetSubDelay()
+    {
+        SubDelay = 0;
+        if (_handle != IntPtr.Zero)
+        {
+            double val = 0;
+            MpvNative.mpv_set_property(_handle, "sub-delay", MpvFormat.Double, ref val);
+        }
+    }
+
+    public void AdjustVolume(double delta) => SetVolume(Volume + delta);
+
+    public void ToggleMute()
+    {
+        if (_handle == IntPtr.Zero) return;
+        int flag = IsMuted ? 0 : 1;
+        MpvNative.mpv_set_property(_handle, "mute", MpvFormat.Flag, ref flag);
+    }
+
+    public void SetSpeed(double speed)
+    {
+        double clamped = Math.Round(Math.Clamp(speed, 0.25, 4.0), 2);
+        Speed = clamped;
+        if (_handle == IntPtr.Zero) return;
+        MpvNative.mpv_set_property_async(_handle, 0, "speed", MpvFormat.Double, ref clamped);
+    }
+
+    public void SetAudioTrack(int? trackId)
+    {
+        if (_handle == IntPtr.Zero) return;
+        MpvNative.mpv_set_property_string(_handle, "aid", trackId.HasValue ? trackId.Value.ToString(CultureInfo.InvariantCulture) : "no");
+        TracksChanged?.Invoke();
+    }
+
+    public void SetSubtitleTrack(int? trackId)
+    {
+        if (_handle == IntPtr.Zero) return;
+        MpvNative.mpv_set_property_string(_handle, "sid", trackId.HasValue ? trackId.Value.ToString(CultureInfo.InvariantCulture) : "no");
+        TracksChanged?.Invoke();
+    }
+
+    public void AddExternalSubtitle(string subtitlePath)
+    {
+        if (_handle == IntPtr.Zero || !File.Exists(subtitlePath)) return;
+        MpvNative.CommandUtf8(_handle, false, "sub-add", subtitlePath, "select");
+        TracksChanged?.Invoke();
+    }
+
+    public void CycleAudioTrack()
+    {
+        if (_handle == IntPtr.Zero || !HasMedia) return;
+        MpvNative.CommandUtf8(_handle, true, "cycle", "audio");
+    }
+
+    public void CycleSubtitleTrack()
+    {
+        if (_handle == IntPtr.Zero || !HasMedia) return;
+        MpvNative.CommandUtf8(_handle, true, "cycle", "sub");
+    }
+
+    public void SetAspectRatio(string ratio)
+    {
+        if (_handle == IntPtr.Zero) return;
+        // ratio: "-1" (Auto), "16:9", "4:3", "21:9", "1:1"
+        MpvNative.mpv_set_property_string(_handle, "video-aspect-override", ratio);
+    }
+
+    public void SetKeepAspect(bool keep)
+    {
+        if (_handle == IntPtr.Zero) return;
+        MpvNative.mpv_set_property_string(_handle, "keepaspect", keep ? "yes" : "no");
+    }
+
+    public void SetPanScan(double panscan)
+    {
+        if (_handle == IntPtr.Zero) return;
+        double clamped = Math.Clamp(panscan, 0.0, 1.0);
+        MpvNative.mpv_set_property(_handle, "panscan", MpvFormat.Double, ref clamped);
+    }
+
+    public void SetCursorAutoHide(int milliseconds)
+    {
+        if (_handle == IntPtr.Zero) return;
+        MpvNative.mpv_set_property_string(_handle, "cursor-autohide",
+            milliseconds <= 0 ? "no" : milliseconds.ToString(CultureInfo.InvariantCulture));
+    }
+
+    public string? TakeScreenshot()
+    {
+        if (_handle == IntPtr.Zero || !HasMedia) return null;
+        string file = Path.Combine(ScreenshotDirectory, $"LiteVLC_{DateTime.Now:yyyyMMdd_HHmmss}.png");
+        int rc = MpvNative.CommandUtf8(_handle, false, "screenshot-to-file", file, "subtitles");
+        return rc >= 0 ? file : null;
+    }
+
+    public List<MediaTrack> GetTracks()
+    {
+        var list = new List<MediaTrack>();
+        if (_handle == IntPtr.Zero) return list;
+
+        string? json = GetStringProperty("track-list");
+        if (string.IsNullOrWhiteSpace(json)) return list;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array) return list;
+            foreach (var el in doc.RootElement.EnumerateArray())
+            {
+                int id = el.TryGetProperty("id", out var idProp) ? idProp.GetInt32() : 0;
+                string type = el.TryGetProperty("type", out var typeProp) ? (typeProp.GetString() ?? "") : "";
+                string title = el.TryGetProperty("title", out var tProp) ? (tProp.GetString() ?? "") : "";
+                string lang = el.TryGetProperty("lang", out var lProp) ? (lProp.GetString() ?? "") : "";
+                string codec = el.TryGetProperty("codec", out var cProp) ? (cProp.GetString() ?? "") : "";
+                bool selected = el.TryGetProperty("selected", out var sProp) && sProp.ValueKind == JsonValueKind.True;
+                bool external = el.TryGetProperty("external", out var eProp) && eProp.ValueKind == JsonValueKind.True;
+
+                list.Add(new MediaTrack
+                {
+                    Id = id,
+                    Type = type,
+                    Title = title,
+                    Lang = lang,
+                    Codec = codec,
+                    Selected = selected,
+                    External = external
+                });
+            }
+        }
+        catch
+        {
+            // Ignore malformed track-list transitions during load
+        }
+        return list;
+    }
+
+    public PlaybackStats GetStatsSnapshot()
+    {
+        var stats = new PlaybackStats
+        {
+            CacheSeconds = CacheDuration,
+            LastSeekMs = LastSeekMs,
+            FastSeekEnabled = FastSeekEnabled
+        };
+
+        if (_handle == IntPtr.Zero || !HasMedia) return stats;
+
+        stats.VideoCodec = GetStringProperty("video-codec-name") ?? GetStringProperty("video-format") ?? "—";
+        stats.AudioCodec = GetStringProperty("audio-codec-name") ?? "—";
+        stats.HwDec = GetStringProperty("hwdec-current") ?? "software";
+        if (string.IsNullOrWhiteSpace(stats.HwDec) || stats.HwDec == "no")
+            stats.HwDec = "software";
+
+        long w = GetInt64Property("width");
+        long h = GetInt64Property("height");
+        stats.Resolution = (w > 0 && h > 0) ? $"{w}×{h}" : "—";
+
+        stats.Fps = GetDoubleProperty("estimated-vf-fps");
+        stats.AvSyncMs = GetDoubleProperty("avsync") * 1000.0;
+        stats.DroppedFrames = GetInt64Property("frame-drop-count");
+        return stats;
+    }
+
+    private string? GetStringProperty(string name)
+    {
+        if (_handle == IntPtr.Zero) return null;
+        IntPtr ptr = MpvNative.mpv_get_property_string(_handle, name);
+        if (ptr == IntPtr.Zero) return null;
+        try
+        {
+            return MpvNative.PtrToUtf8(ptr);
+        }
+        finally
+        {
+            MpvNative.mpv_free(ptr);
+        }
+    }
+
+    private double GetDoubleProperty(string name)
+    {
+        if (_handle == IntPtr.Zero) return 0;
+        return MpvNative.mpv_get_property(_handle, name, MpvFormat.Double, out double val) >= 0 ? val : 0;
+    }
+
+    private long GetInt64Property(string name)
+    {
+        if (_handle == IntPtr.Zero) return 0;
+        return MpvNative.mpv_get_property(_handle, name, MpvFormat.Int64, out long val) >= 0 ? val : 0;
+    }
+
+    private void EventLoop()
+    {
+        long lastTimeUiPush = 0;
+
+        while (_running && _handle != IntPtr.Zero)
+        {
+            IntPtr evPtr = MpvNative.mpv_wait_event(_handle, 0.25);
+            if (evPtr == IntPtr.Zero) continue;
+
+            var ev = Marshal.PtrToStructure<MpvEvent>(evPtr);
+            switch (ev.EventId)
+            {
+                case MpvEventId.None:
+                    break;
+
+                case MpvEventId.Shutdown:
+                    _running = false;
+                    break;
+
+                case MpvEventId.FileLoaded:
+                    HasMedia = true;
+                    FileLoaded?.Invoke();
+                    TracksChanged?.Invoke();
+                    break;
+
+                case MpvEventId.EndFile:
+                    if (ev.Data != IntPtr.Zero)
+                    {
+                        var endData = Marshal.PtrToStructure<MpvEventEndFile>(ev.Data);
+                        bool isEof = endData.Reason == MpvEndFileReason.Eof;
+                        if (endData.Reason == MpvEndFileReason.Stop)
+                            HasMedia = false;
+                        FileEnded?.Invoke(isEof);
+                    }
+                    break;
+
+                case MpvEventId.PlaybackRestart:
+                {
+                    long start = Interlocked.Exchange(ref _seekStartTicks, 0);
+                    if (start > 0)
+                    {
+                        double ms = (Stopwatch.GetTimestamp() - start) * 1000.0 / Stopwatch.Frequency;
+                        LastSeekMs = Math.Round(ms, 1);
+                        SeekCompleted?.Invoke(LastSeekMs);
+                    }
+                    break;
+                }
+
+                case MpvEventId.PropertyChange:
+                    if (ev.Data != IntPtr.Zero)
+                        HandlePropertyChange(ev.ReplyUserdata, ev.Data, ref lastTimeUiPush);
+                    break;
+            }
+        }
+    }
+
+    private void HandlePropertyChange(ulong userdata, IntPtr propPtr, ref long lastTimeUiPush)
+    {
+        var prop = Marshal.PtrToStructure<MpvEventProperty>(propPtr);
+        if (prop.Data == IntPtr.Zero || prop.Format == MpvFormat.None) return;
+
+        switch (userdata)
+        {
+            case PropTimePos when prop.Format == MpvFormat.Double:
+            {
+                double val = Marshal.PtrToStructure<double>(prop.Data);
+                Position = val;
+                // Throttle UI updates to ~15 Hz so WPF stays feather-light
+                long now = Environment.TickCount64;
+                if (now - lastTimeUiPush >= 65)
+                {
+                    lastTimeUiPush = now;
+                    PositionChanged?.Invoke(val);
+                }
+                break;
+            }
+
+            case PropDuration when prop.Format == MpvFormat.Double:
+                Duration = Marshal.PtrToStructure<double>(prop.Data);
+                DurationChanged?.Invoke(Duration);
+                break;
+
+            case PropCacheDuration when prop.Format == MpvFormat.Double:
+                CacheDuration = Marshal.PtrToStructure<double>(prop.Data);
+                CacheDurationChanged?.Invoke(CacheDuration);
+                break;
+
+            case PropPause when prop.Format == MpvFormat.Flag:
+                IsPaused = Marshal.ReadInt32(prop.Data) != 0;
+                PauseChanged?.Invoke(IsPaused);
+                break;
+
+            case PropVolume when prop.Format == MpvFormat.Double:
+                Volume = Marshal.PtrToStructure<double>(prop.Data);
+                VolumeChanged?.Invoke(Volume);
+                break;
+
+            case PropMute when prop.Format == MpvFormat.Flag:
+                IsMuted = Marshal.ReadInt32(prop.Data) != 0;
+                MuteChanged?.Invoke(IsMuted);
+                break;
+
+            case PropSpeed when prop.Format == MpvFormat.Double:
+                Speed = Marshal.PtrToStructure<double>(prop.Data);
+                SpeedChanged?.Invoke(Speed);
+                break;
+
+            case PropMediaTitle when prop.Format == MpvFormat.String:
+                IntPtr strPtr = Marshal.ReadIntPtr(prop.Data);
+                CurrentTitle = MpvNative.PtrToUtf8(strPtr) ?? "";
+                MediaTitleChanged?.Invoke(CurrentTitle);
+                break;
+
+            case PropTrackListCount:
+                TracksChanged?.Invoke();
+                break;
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _running = false;
+        _seekCoalesceTimer.Dispose();
+
+        IntPtr h;
+        lock (_lock)
+        {
+            h = _handle;
+            _handle = IntPtr.Zero;
+        }
+
+        if (h != IntPtr.Zero)
+        {
+            // Terminate libmpv off the UI thread so any VO SendMessage to the child HWND never deadlocks.
+            var cleanup = new System.Threading.Tasks.Task(() =>
+            {
+                try
+                {
+                    MpvNative.mpv_wakeup(h);
+                    _eventThread?.Join(500);
+                }
+                catch { }
+
+                try
+                {
+                    MpvNative.mpv_terminate_destroy(h);
+                }
+                catch { }
+            });
+            cleanup.Start();
+            cleanup.Wait(600);
+        }
+    }
+}
