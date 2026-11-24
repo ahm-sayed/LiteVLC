@@ -15,6 +15,7 @@ using System.Windows.Threading;
 using LiteVLC.Controls;
 using LiteVLC.Engine;
 using LiteVLC.Models;
+using LiteVLC.Services;
 using LiteVLC.Windows;
 using Microsoft.Win32;
 
@@ -27,6 +28,8 @@ public partial class MainWindow : Window
     private readonly VideoHost _videoHost = new();
     private readonly ObservableCollection<PlaylistItem> _playlist = new();
     private readonly AppPersistedState _state;
+    private readonly AutoUpdaterService _updater = new();
+    private UpdateCheckResult? _cachedUpdateResult;
 
     private OsdOverlayWindow? _osdOverlay;
     private FullscreenControlsWindow? _fsControls;
@@ -432,6 +435,9 @@ public partial class MainWindow : Window
 
         if (_startupArgs.Length > 0)
             HandleDroppedPaths(_startupArgs);
+
+        // Silent background check for newer GitHub releases (non-blocking)
+        _ = CheckForUpdateSilentlyAsync();
     }
 
     private void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
@@ -527,9 +533,22 @@ public partial class MainWindow : Window
             {
                 string ext = Path.GetExtension(raw);
                 if (SubtitleExtensions.Contains(ext))
+                {
                     subtitleFiles.Add(raw);
+                }
+                else if (PlaylistFileService.IsPlaylistFile(raw))
+                {
+                    var loaded = PlaylistFileService.Load(raw);
+                    if (loaded.Count > 0)
+                    {
+                        LoadParsedPlaylist(loaded, Path.GetFileName(raw));
+                        return;
+                    }
+                }
                 else
+                {
                     mediaFiles.Add(raw);
+                }
             }
         }
 
@@ -775,6 +794,23 @@ public partial class MainWindow : Window
         }
     }
 
+    private void SeekTrack_MouseWheel(object sender, MouseWheelEventArgs e)
+    {
+        if (!_engine.HasMedia || _engine.Duration <= 0) return;
+        bool shift = (Keyboard.Modifiers & ModifierKeys.Shift) != 0;
+        bool ctrl = (Keyboard.Modifiers & ModifierKeys.Control) != 0;
+        double step = shift ? 10.0 : (ctrl ? 1.0 : 5.0);
+        _engine.SeekRelative(e.Delta > 0 ? step : -step);
+        e.Handled = true;
+    }
+
+    private void VolumeSlider_MouseWheel(object sender, MouseWheelEventArgs e)
+    {
+        _engine.AdjustVolume(e.Delta > 0 ? 5 : -5);
+        ShowOsd($"Volume {Math.Round(_engine.Volume)}%");
+        e.Handled = true;
+    }
+
     // ==================== KEYBOARD SHORTCUTS ====================
 
     private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
@@ -930,8 +966,14 @@ public partial class MainWindow : Window
                 break;
             }
 
+            case Key.T when ctrl:
+            case Key.K when !ctrl:
+                OpenTrimModal();
+                e.Handled = true;
+                break;
+
             case Key.I:
-            case Key.T:
+            case Key.T when !ctrl:
                 ToggleHud();
                 e.Handled = true;
                 break;
@@ -1189,11 +1231,19 @@ public partial class MainWindow : Window
         aspect.Click += (_, _) => CycleAspectRatio();
         menu.Items.Add(aspect);
 
+        var trimItem = new MenuItem { Header = "Trim / Cut Video Clip...", InputGestureText = "Ctrl+T" };
+        trimItem.Click += (_, _) => OpenTrimModal();
+        menu.Items.Add(trimItem);
+
         var shot = new MenuItem { Header = "Take Screenshot", InputGestureText = "S" };
         shot.Click += (_, _) => TakeScreenshot();
         menu.Items.Add(shot);
 
         menu.Items.Add(new Separator());
+
+        var updItem = new MenuItem { Header = "Check for Updates (GitHub)..." };
+        updItem.Click += (_, _) => OpenUpdateDialog();
+        menu.Items.Add(updItem);
 
         var hud = new MenuItem { Header = "Performance HUD", InputGestureText = "I", IsCheckable = true, IsChecked = _osdOverlay?.IsHudVisible == true };
         hud.Click += (_, _) => ToggleHud();
@@ -1458,6 +1508,193 @@ public partial class MainWindow : Window
             PlayIndex(PlaylistListBox.SelectedIndex);
     }
 
+    private void PlaylistListBox_MouseRightButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        int idx = PlaylistListBox.SelectedIndex;
+        var menu = new ContextMenu();
+
+        if (idx >= 0 && idx < _playlist.Count)
+        {
+            var playMi = new MenuItem { Header = "Play Now" };
+            playMi.Click += (_, _) => PlayIndex(idx);
+            menu.Items.Add(playMi);
+
+            var moveUp = new MenuItem { Header = "Move Up", IsEnabled = idx > 0 };
+            moveUp.Click += (_, _) => MovePlaylistItem(idx, idx - 1);
+            menu.Items.Add(moveUp);
+
+            var moveDown = new MenuItem { Header = "Move Down", IsEnabled = idx < _playlist.Count - 1 };
+            moveDown.Click += (_, _) => MovePlaylistItem(idx, idx + 1);
+            menu.Items.Add(moveDown);
+
+            var removeMi = new MenuItem { Header = "Remove from Playlist" };
+            removeMi.Click += (_, _) => RemovePlaylistItem(idx);
+            menu.Items.Add(removeMi);
+            menu.Items.Add(new Separator());
+        }
+
+        var saveMi = new MenuItem { Header = "Save Playlist (.xspf / .m3u8)...", IsEnabled = _playlist.Count > 0 };
+        saveMi.Click += (_, _) => SavePlaylistDialog();
+        menu.Items.Add(saveMi);
+
+        var loadMi = new MenuItem { Header = "Load Playlist (.xspf / .m3u8)..." };
+        loadMi.Click += (_, _) => LoadPlaylistDialog();
+        menu.Items.Add(loadMi);
+
+        menu.IsOpen = true;
+    }
+
+    private void MovePlaylistItem(int fromIdx, int toIdx)
+    {
+        if (fromIdx < 0 || toIdx < 0 || fromIdx >= _playlist.Count || toIdx >= _playlist.Count) return;
+        _playlist.Move(fromIdx, toIdx);
+        if (_currentIndex == fromIdx) _currentIndex = toIdx;
+        else if (_currentIndex == toIdx) _currentIndex = fromIdx;
+        PlaylistListBox.SelectedIndex = toIdx;
+    }
+
+    private void RemovePlaylistItem(int idx)
+    {
+        if (idx < 0 || idx >= _playlist.Count) return;
+        _playlist.RemoveAt(idx);
+        if (_currentIndex == idx) _currentIndex = -1;
+        else if (_currentIndex > idx) _currentIndex--;
+        UpdatePlaylistHeader();
+    }
+
+    private void SavePlaylist_Click(object sender, RoutedEventArgs e) => SavePlaylistDialog();
+    private void LoadPlaylist_Click(object sender, RoutedEventArgs e) => LoadPlaylistDialog();
+
+    private void SavePlaylistDialog()
+    {
+        if (_playlist.Count == 0)
+        {
+            ShowOsd("Playlist is Empty", "Add files first");
+            return;
+        }
+
+        var dlg = new SaveFileDialog
+        {
+            Title = "Save Playlist",
+            FileName = "MyPlaylist.xspf",
+            Filter = "VLC XSPF Playlist (*.xspf)|*.xspf|M3U8 Playlist (*.m3u8)|*.m3u8|M3U Playlist (*.m3u)|*.m3u"
+        };
+
+        if (dlg.ShowDialog(this) == true)
+        {
+            try
+            {
+                PlaylistFileService.Save(dlg.FileName, _playlist);
+                ShowOsd("Playlist Saved", Path.GetFileName(dlg.FileName), durationMs: 2000);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, $"Could not save playlist:\n{ex.Message}", "LiteVLC", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+    }
+
+    private void LoadPlaylistDialog()
+    {
+        var dlg = new OpenFileDialog
+        {
+            Title = "Open Playlist",
+            Filter = "Playlists (*.xspf;*.m3u8;*.m3u)|*.xspf;*.m3u8;*.m3u|All Files|*.*"
+        };
+
+        if (dlg.ShowDialog(this) == true)
+        {
+            var entries = PlaylistFileService.Load(dlg.FileName);
+            if (entries.Count == 0)
+            {
+                ShowOsd("Empty Playlist", Path.GetFileName(dlg.FileName));
+                return;
+            }
+            LoadParsedPlaylist(entries, Path.GetFileName(dlg.FileName));
+        }
+    }
+
+    private void LoadParsedPlaylist(List<(string Path, string Title)> entries, string playlistName)
+    {
+        SaveCurrentResumePosition();
+        _playlist.Clear();
+        _currentIndex = -1;
+
+        foreach (var (path, title) in entries)
+            _playlist.Add(new PlaylistItem { Path = path, Title = title });
+
+        UpdatePlaylistHeader();
+        if (_playlist.Count > 0)
+        {
+            if (!_isPlaylistOpen && !_isFullscreen)
+                TogglePlaylistDrawer();
+            PlayIndex(0);
+            ShowOsd($"Playlist: {playlistName}", $"{_playlist.Count} items", durationMs: 2000);
+        }
+    }
+
+    // ==================== VIDEO TRIMMER & AUTO-UPDATER ====================
+
+    private void TrimVideo_Click(object sender, RoutedEventArgs e) => OpenTrimModal();
+
+    private void OpenTrimModal()
+    {
+        if (!_engine.HasMedia || _currentIndex < 0 || _currentIndex >= _playlist.Count)
+        {
+            ShowOsd("Open a Video First", "Nothing playing to cut");
+            return;
+        }
+
+        var current = _playlist[_currentIndex];
+        if (current.IsStream || !File.Exists(current.Path))
+        {
+            ShowOsd("Local Files Only", "Cannot trim network streams");
+            return;
+        }
+
+        bool wasPlaying = !_engine.IsPaused;
+        if (wasPlaying) _engine.SetPause(true);
+
+        var dlg = new TrimVideoDialog(current.Path, _engine.Duration, () => _engine.Position) { Owner = this };
+        if (dlg.ShowDialog() == true && !string.IsNullOrWhiteSpace(dlg.SavedClipPath))
+            ShowOsd("Clip Saved", Path.GetFileName(dlg.SavedClipPath), durationMs: 2200);
+    }
+
+    private void CheckUpdate_Click(object sender, RoutedEventArgs e) => OpenUpdateDialog();
+
+    private void OpenUpdateDialog()
+    {
+        var dlg = new UpdateDialog(_cachedUpdateResult is { UpdateAvailable: true } ? _cachedUpdateResult : null) { Owner = this };
+        if (dlg.ShowDialog() == true && dlg.UpdateLaunched)
+        {
+            // Close immediately so silent Inno Setup replaces the app and relaunches it cleanly!
+            Application.Current.Shutdown();
+        }
+    }
+
+    private async System.Threading.Tasks.Task CheckForUpdateSilentlyAsync()
+    {
+        try
+        {
+            await System.Threading.Tasks.Task.Delay(3500);
+            var res = await _updater.CheckForUpdateAsync();
+            _cachedUpdateResult = res;
+            if (res.UpdateAvailable)
+            {
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    UpdateDot.Visibility = Visibility.Visible;
+                    UpdateBtnText.Text = $"Update {res.TagName}";
+                    UpdateBtn.Background = new SolidColorBrush(Color.FromRgb(0x0E, 0x26, 0x1A));
+                    UpdateBtn.BorderBrush = new SolidColorBrush(Color.FromRgb(0x25, 0x5E, 0x3F));
+                    UpdateBtn.Foreground = new SolidColorBrush(Color.FromRgb(0x4A, 0xDE, 0x80));
+                    UpdateBtn.ToolTip = $"New LiteVLC {res.TagName} available on GitHub — click to update automatically!";
+                });
+            }
+        }
+        catch { }
+    }
+
     private void PlayNext()
     {
         if (_playlist.Count == 0) return;
@@ -1501,6 +1738,7 @@ public partial class MainWindow : Window
         };
         _fsControls.VolumeRequested += v => _engine.SetVolume(v);
         _fsControls.SeekAbsoluteRequested += (t, fast) => _engine.SeekAbsolute(t, forceFast: fast);
+        _fsControls.SeekRelativeRequested += d => _engine.SeekRelative(d);
         _fsControls.SpeedCycleRequested += () =>
         {
             double[] cycle = [1.0, 1.25, 1.5, 1.75, 2.0, 0.5, 0.75];
@@ -1693,13 +1931,24 @@ public partial class MainWindow : Window
     {
         var dlg = new OpenFileDialog
         {
-            Title = "Open Media File(s)",
+            Title = "Open Media File(s) or Playlist",
             Multiselect = true,
-            Filter = "Media Files|*.mp4;*.mkv;*.avi;*.webm;*.mov;*.wmv;*.flv;*.m4v;*.ts;*.m2ts;*.mpg;*.mpeg;*.mp3;*.flac;*.wav;*.ogg;*.opus;*.aac;*.m4a;*.m3u8|All Files|*.*"
+            Filter = "Media & Playlists|*.mp4;*.mkv;*.avi;*.webm;*.mov;*.wmv;*.flv;*.m4v;*.ts;*.m2ts;*.mpg;*.mpeg;*.mp3;*.flac;*.wav;*.ogg;*.opus;*.aac;*.m4a;*.xspf;*.m3u8;*.m3u|Playlists (*.xspf;*.m3u8;*.m3u)|*.xspf;*.m3u8;*.m3u|All Files|*.*"
         };
 
         if (dlg.ShowDialog(this) == true && dlg.FileNames.Length > 0)
+        {
+            if (dlg.FileNames.Length == 1 && PlaylistFileService.IsPlaylistFile(dlg.FileNames[0]))
+            {
+                var loaded = PlaylistFileService.Load(dlg.FileNames[0]);
+                if (loaded.Count > 0)
+                {
+                    LoadParsedPlaylist(loaded, Path.GetFileName(dlg.FileNames[0]));
+                    return;
+                }
+            }
             EnqueueAndPlay(dlg.FileNames, replacePlaylist: !appendToPlaylist);
+        }
     }
 
     private void OpenSubtitleDialog()

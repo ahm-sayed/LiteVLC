@@ -60,7 +60,8 @@
                           MouseLeftButtonDown="SeekTrack_MouseLeftButtonDown"
                           MouseMove="SeekTrack_MouseMove"
                           MouseLeftButtonUp="SeekTrack_MouseLeftButtonUp"
-                          MouseLeave="SeekTrack_MouseLeave">
+                          MouseLeave="SeekTrack_MouseLeave"
+                          MouseWheel="SeekTrack_MouseWheel">
                         <Grid Height="3.5" VerticalAlignment="Center" RenderTransformOrigin="0.5,0.5">
                             <Grid.RenderTransform>
                                 <ScaleTransform x:Name="SeekBarHeightScale" ScaleY="1"/>

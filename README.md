@@ -8,13 +8,16 @@
 
 ## Download (Windows 10/11 64-bit)
 
-Download the latest standalone Windows Installer (**`LiteVLC-Setup-1.2.0.exe`** — includes .NET runtime & `libmpv-2.dll`, no extra setup needed) from the **[Releases](https://github.com/ahm-sayed/LiteVLC/releases/latest)** page.
+Download the latest standalone Windows Installer (**`LiteVLC-Setup-1.3.0.exe`** — includes .NET runtime & `libmpv-2.dll`, no extra setup needed) from the **[Releases](https://github.com/ahm-sayed/LiteVLC/releases/latest)** page.
 
 ---
 
 ## Key Features
 
-- **Zero-Lag ±10s Seeking**: 48 MiB forward / 20 MiB backward RAM demuxer cache, fast keyframe seeking (`hr-seek=no` with Exact Seek toggle), persistent WASAPI stream, and 55ms rapid-tap coalescing.
+- **Zero-Lag Live ±10s Seeking & Wheel Scrubbing**: 48 MiB forward / 20 MiB backward RAM demuxer cache, immediate leading-edge keyframe visual preview while holding/tapping `→`/`←`, persistent WASAPI stream, and **Mouse Wheel scrubbing directly over the Seek Bar** (`±5s`, `Shift+Wheel ±10s`, `Ctrl+Wheel ±1s`).
+- **Built-in Video Trimmer / Cutter (`Ctrl+T` / `K`)**: Frame-exact cutting directly via bundled `libmpv-2.dll` (zero external tools required!) plus optional lossless stream-copy mode.
+- **VLC-Compatible Playlists (`.xspf` / `.m3u8`)**: Save and reopen playlists of movies or songs in 1 click, drag & drop `.xspf`/`.m3u8` files, reorder or remove items from the animated playlist drawer.
+- **Automatic One-Click GitHub Updater**: Checks `ahm-sayed/LiteVLC` Releases automatically, downloads the newest setup installer with progress, installs silently, and relaunches LiteVLC automatically.
 - **Direct3D 11 Hardware Decoding**: Zero-copy GPU rendering (`vo=gpu`, `gpu-api=d3d11`, `hwdec=auto-safe`) with flicker-free DirectFlip playback.
 - **True Borderless Fullscreen**: Covers 100% of the monitor (including the Windows Taskbar) with locked video edges and a slim VLC-style floating bottom controller that stays below subtitles.
 - **Accurate Online Subtitle Search (`D` / `Ctrl+Shift+S`)**: 64-bit OpenSubtitles file-hash matching (`EXACT SYNC`), Cinemeta IMDB movie/series resolution, release-tag ranking, automatic Arabic `Windows-1256 → UTF-8` conversion, and live sync adjustment (`G` / `H`).

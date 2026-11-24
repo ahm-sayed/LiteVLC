@@ -53,6 +53,7 @@ public partial class FullscreenControlsWindow : Window
     public event Action? MuteRequested;
     public event Action<double>? VolumeRequested;
     public event Action<double, bool>? SeekAbsoluteRequested;
+    public event Action<double>? SeekRelativeRequested;
     public event Action? SpeedCycleRequested;
     public event Action? AspectCycleRequested;
     public event Action? ExitFullscreenRequested;
@@ -265,6 +266,16 @@ public partial class FullscreenControlsWindow : Window
             SeekThumbScale.BeginAnimation(ScaleTransform.ScaleXProperty, new DoubleAnimation(0.85, TimeSpan.FromMilliseconds(150)) { EasingFunction = ease });
             SeekThumbScale.BeginAnimation(ScaleTransform.ScaleYProperty, new DoubleAnimation(0.85, TimeSpan.FromMilliseconds(150)) { EasingFunction = ease });
         }
+    }
+
+    private void SeekTrack_MouseWheel(object sender, MouseWheelEventArgs e)
+    {
+        if (_duration <= 0) return;
+        bool shift = (Keyboard.Modifiers & ModifierKeys.Shift) != 0;
+        bool ctrl = (Keyboard.Modifiers & ModifierKeys.Control) != 0;
+        double step = shift ? 10.0 : (ctrl ? 1.0 : 5.0);
+        SeekRelativeRequested?.Invoke(e.Delta > 0 ? step : -step);
+        e.Handled = true;
     }
 
     private void Window_MouseEnter(object sender, MouseEventArgs e)

@@ -1,5 +1,5 @@
 #define MyAppName "LiteVLC"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.3.0"
 #define MyAppPublisher "Ahmed Sayed"
 #define MyAppURL "https://github.com/ahm-sayed/LiteVLC"
 #define MyAppExeName "LiteVLC.exe"
@@ -59,6 +59,8 @@ Root: HKA; Subkey: "Software\Classes\.m4v\OpenWithList\{#MyAppExeName}"; Flags: 
 Root: HKA; Subkey: "Software\Classes\.ts\OpenWithList\{#MyAppExeName}"; Flags: uninsdeletekey; Tasks: associatevideo
 Root: HKA; Subkey: "Software\Classes\.mp3\OpenWithList\{#MyAppExeName}"; Flags: uninsdeletekey; Tasks: associatevideo
 Root: HKA; Subkey: "Software\Classes\.flac\OpenWithList\{#MyAppExeName}"; Flags: uninsdeletekey; Tasks: associatevideo
+Root: HKA; Subkey: "Software\Classes\.xspf\OpenWithList\{#MyAppExeName}"; Flags: uninsdeletekey; Tasks: associatevideo
+Root: HKA; Subkey: "Software\Classes\.m3u8\OpenWithList\{#MyAppExeName}"; Flags: uninsdeletekey; Tasks: associatevideo
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

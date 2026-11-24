@@ -18,11 +18,14 @@ public sealed class MpvEngine : IDisposable
     private volatile bool _disposed;
     private readonly object _lock = new();
 
-    // Seek coalescing state (eliminates decoder thrashing on rapid +10s taps)
+    // Live throttled seek state (leading-edge immediate visual preview + trailing accuracy)
     private readonly object _seekLock = new();
-    private double _pendingSeekDelta;
-    private double _seekBaselineTime;
-    private bool _hasPendingSeek;
+    private double _osdAccumulatedDelta;
+    private double _liveSeekTarget;
+    private double _lastDispatchedSeekTarget = double.NaN;
+    private long _lastSeekDispatchMs;
+    private long _lastSeekInputMs;
+    private bool _hasTrailingSeek;
     private readonly Timer _seekCoalesceTimer;
     private long _seekStartTicks;
 
@@ -233,52 +236,86 @@ public sealed class MpvEngine : IDisposable
     }
 
     /// <summary>
-    /// Zero-lag coalesced relative seek (e.g. +10s / -10s).
-    /// Rapid keypresses accumulate cleanly within 55ms into one fast keyframe seek.
+    /// Live visual relative seek (e.g. +10s / -10s or seekbar wheel).
+    /// Seeks immediately on first press and updates frames live every ~70ms while holding/tapping
+    /// so you see the scene move in real time without choking the decoder.
     /// </summary>
     public void SeekRelative(double deltaSeconds)
     {
         if (_handle == IntPtr.Zero || !HasMedia) return;
 
         double accumulated;
-        double predicted;
+        double target;
+        bool dispatchNow;
+
         lock (_seekLock)
         {
-            if (!_hasPendingSeek)
-            {
-                _seekBaselineTime = Position;
-                _pendingSeekDelta = 0;
-                _hasPendingSeek = true;
-            }
-            _pendingSeekDelta += deltaSeconds;
-            accumulated = _pendingSeekDelta;
-            predicted = Duration > 0
-                ? Math.Clamp(_seekBaselineTime + accumulated, 0, Duration)
-                : Math.Max(0, _seekBaselineTime + accumulated);
+            long now = Environment.TickCount64;
+            bool isContinuingBurst = (now - _lastSeekInputMs) <= 650 && !double.IsNaN(_lastDispatchedSeekTarget);
+            _lastSeekInputMs = now;
 
-            // Coalesce rapid consecutive taps into one clean seek
-            _seekCoalesceTimer.Change(55, Timeout.Infinite);
+            if (!isContinuingBurst)
+            {
+                _osdAccumulatedDelta = 0;
+                _liveSeekTarget = Position;
+            }
+
+            _osdAccumulatedDelta += deltaSeconds;
+            _liveSeekTarget = Duration > 0
+                ? Math.Clamp(_liveSeekTarget + deltaSeconds, 0, Duration)
+                : Math.Max(0, _liveSeekTarget + deltaSeconds);
+
+            accumulated = _osdAccumulatedDelta;
+            target = _liveSeekTarget;
+
+            // Leading-edge dispatch: show the new scene immediately if >= 70ms passed since last seek!
+            if (now - _lastSeekDispatchMs >= 70)
+            {
+                _lastSeekDispatchMs = now;
+                _lastDispatchedSeekTarget = target;
+                _hasTrailingSeek = false;
+                _seekCoalesceTimer.Change(Timeout.Infinite, Timeout.Infinite);
+                dispatchNow = true;
+            }
+            else
+            {
+                // Queue a trailing flush so the final target always lands accurately
+                _hasTrailingSeek = true;
+                int remaining = (int)Math.Clamp(70 - (now - _lastSeekDispatchMs), 20, 70);
+                _seekCoalesceTimer.Change(remaining, Timeout.Infinite);
+                dispatchNow = false;
+            }
         }
 
-        SeekPreview?.Invoke(accumulated, predicted);
+        SeekPreview?.Invoke(accumulated, target);
+
+        if (dispatchNow)
+            DispatchAbsoluteSeek(target, forceFast: true);
     }
 
     private void FlushPendingSeek()
     {
-        double delta;
+        double target;
         lock (_seekLock)
         {
-            if (!_hasPendingSeek || _disposed || _handle == IntPtr.Zero) return;
-            delta = _pendingSeekDelta;
-            _pendingSeekDelta = 0;
-            _hasPendingSeek = false;
+            if (!_hasTrailingSeek || _disposed || _handle == IntPtr.Zero) return;
+            target = _liveSeekTarget;
+            _hasTrailingSeek = false;
+            if (!double.IsNaN(_lastDispatchedSeekTarget) && Math.Abs(target - _lastDispatchedSeekTarget) < 0.05)
+                return;
+            _lastSeekDispatchMs = Environment.TickCount64;
+            _lastDispatchedSeekTarget = target;
         }
 
-        if (Math.Abs(delta) < 0.001) return;
+        DispatchAbsoluteSeek(target, forceFast: false);
+    }
 
+    private void DispatchAbsoluteSeek(double targetSeconds, bool forceFast)
+    {
+        if (_handle == IntPtr.Zero) return;
         Interlocked.Exchange(ref _seekStartTicks, Stopwatch.GetTimestamp());
-        string mode = FastSeekEnabled ? "relative+keyframes" : "relative+exact";
-        MpvNative.CommandUtf8(_handle, true, "seek", delta.ToString("0.###", CultureInfo.InvariantCulture), mode);
+        string mode = (forceFast || FastSeekEnabled) ? "absolute+keyframes" : "absolute+exact";
+        MpvNative.CommandUtf8(_handle, true, "seek", targetSeconds.ToString("0.###", CultureInfo.InvariantCulture), mode);
     }
 
     private void CancelPendingSeek()
@@ -286,8 +323,9 @@ public sealed class MpvEngine : IDisposable
         lock (_seekLock)
         {
             _seekCoalesceTimer.Change(Timeout.Infinite, Timeout.Infinite);
-            _pendingSeekDelta = 0;
-            _hasPendingSeek = false;
+            _osdAccumulatedDelta = 0;
+            _hasTrailingSeek = false;
+            _lastDispatchedSeekTarget = double.NaN;
         }
     }
 

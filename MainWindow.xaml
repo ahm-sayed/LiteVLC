@@ -175,6 +175,25 @@
                             <TextBlock Text="HUD" FontSize="11" FontWeight="SemiBold"/>
                         </Button>
 
+                        <!-- GitHub Auto-Update Button -->
+                        <Button x:Name="UpdateBtn"
+                                Style="{StaticResource PillButtonStyle}"
+                                Padding="8,4"
+                                Margin="0,0,6,0"
+                                shell:WindowChrome.IsHitTestVisibleInChrome="True"
+                                Click="CheckUpdate_Click"
+                                ToolTip="Check for Updates on GitHub">
+                            <StackPanel Orientation="Horizontal">
+                                <Ellipse x:Name="UpdateDot"
+                                         Width="6" Height="6"
+                                         Fill="#22C55E"
+                                         Margin="0,0,5,0"
+                                         VerticalAlignment="Center"
+                                         Visibility="Collapsed"/>
+                                <TextBlock x:Name="UpdateBtnText" Text="Update" FontSize="11"/>
+                            </StackPanel>
+                        </Button>
+
                         <!-- Always on Top Pin -->
                         <Button x:Name="PinBtn"
                                 Style="{StaticResource IconButtonStyle}"
@@ -422,6 +441,7 @@
                                  Foreground="#E2E8F0"
                                  ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                                  MouseDoubleClick="PlaylistListBox_MouseDoubleClick"
+                                 MouseRightButtonUp="PlaylistListBox_MouseRightButtonUp"
                                  Padding="7">
                             <ListBox.ItemContainerStyle>
                                 <Style TargetType="ListBoxItem">
@@ -500,11 +520,29 @@
                             </ListBox.ItemTemplate>
                         </ListBox>
 
-                        <Border Grid.Row="2" Padding="12,9" BorderBrush="#1A2234" BorderThickness="0,1,0,0">
-                            <TextBlock Text="Drop multiple videos or folders to queue them"
-                                       Foreground="#64748B"
-                                       FontSize="11"
-                                       HorizontalAlignment="Center"/>
+                        <Border Grid.Row="2" Padding="10,9" BorderBrush="#1A2234" BorderThickness="0,1,0,0">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Button Grid.Column="0"
+                                        Content="Load (.xspf / .m3u8)"
+                                        Style="{StaticResource PillButtonStyle}"
+                                        Padding="8,5"
+                                        Margin="0,0,4,0"
+                                        FontSize="11"
+                                        ToolTip="Open a saved XSPF or M3U8 playlist file"
+                                        Click="LoadPlaylist_Click"/>
+                                <Button Grid.Column="1"
+                                        Content="Save Playlist"
+                                        Style="{StaticResource PillButtonStyle}"
+                                        Padding="8,5"
+                                        Margin="4,0,0,0"
+                                        FontSize="11"
+                                        ToolTip="Save current playlist as VLC-compatible .xspf or .m3u8"
+                                        Click="SavePlaylist_Click"/>
+                            </Grid>
                         </Border>
                     </Grid>
                 </Border>
@@ -550,7 +588,8 @@
                               MouseLeftButtonDown="SeekTrack_MouseLeftButtonDown"
                               MouseMove="SeekTrack_MouseMove"
                               MouseLeftButtonUp="SeekTrack_MouseLeftButtonUp"
-                              MouseLeave="SeekTrack_MouseLeave">
+                              MouseLeave="SeekTrack_MouseLeave"
+                              MouseWheel="SeekTrack_MouseWheel">
                             <!-- Track Bars Container (scales smoothly in Y on hover) -->
                             <Grid x:Name="SeekBarsHolder" Height="4" VerticalAlignment="Center" RenderTransformOrigin="0.5,0.5">
                                 <Grid.RenderTransform>
@@ -742,6 +781,7 @@
                                     Style="{StaticResource SlimSliderStyle}"
                                     VerticalAlignment="Center"
                                     ValueChanged="VolumeSlider_ValueChanged"
+                                    MouseWheel="VolumeSlider_MouseWheel"
                                     ToolTip="Volume (0–200% VLC Boost)"/>
 
                             <TextBlock x:Name="VolumeText"
@@ -780,6 +820,17 @@
                                     Margin="0,0,6,0"
                                     ToolTip="Video Fill / Aspect Ratio (A) — Remove Black Bars"
                                     Click="AspectBtn_Click"/>
+
+                            <!-- Trim / Cut Video Clip -->
+                            <Button Style="{StaticResource IconButtonStyle}"
+                                    Padding="8,6"
+                                    ToolTip="Trim / Cut Video Clip (Ctrl+T / K)"
+                                    Click="TrimVideo_Click">
+                                <Path Data="M 4,4 L 14,14 M 14,4 L 4,14 M 4,15 A 2,2 0 1 0 4,11 M 14,15 A 2,2 0 1 0 14,11"
+                                      Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                                      StrokeThickness="1.5" StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                      Width="14" Height="13" Stretch="Uniform"/>
+                            </Button>
 
                             <!-- Screenshot -->
                             <Button Style="{StaticResource IconButtonStyle}"
