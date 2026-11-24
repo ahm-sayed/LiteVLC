@@ -83,6 +83,82 @@ public sealed class PlaybackStats
     public bool FastSeekEnabled { get; set; } = true;
 }
 
+/// <summary>
+/// Live technical fingerprint probed directly from libmpv stream headers & container metadata.
+/// Used to match exact FPS, resolution, codec, duration/cut, and hidden release metadata for subtitle sync.
+/// </summary>
+public sealed class MediaProbeInfo
+{
+    public long Width { get; init; }
+    public long Height { get; init; }
+    public double Fps { get; init; }
+    public double DurationSeconds { get; init; }
+    public string VideoCodec { get; init; } = "";
+    public double VideoBitrateKbps { get; init; }
+    public long AudioChannels { get; init; }
+    public string EmbeddedTitle { get; init; } = "";
+    public string EmbeddedEncoder { get; init; } = "";
+
+    public string QualityLabel
+    {
+        get
+        {
+            if (Width >= 3600 || Height >= 2000) return "2160p";
+            if (Width >= 1800 || Height >= 1000) return "1080p";
+            if (Width >= 1200 || Height >= 680) return "720p";
+            if (Width > 0 || Height > 0) return "480p";
+            return "";
+        }
+    }
+
+    public string CodecToken
+    {
+        get
+        {
+            string c = VideoCodec.ToLowerInvariant();
+            if (c.Contains("hevc") || c.Contains("h265") || c.Contains("265")) return "x265";
+            if (c.Contains("h264") || c.Contains("avc") || c.Contains("264")) return "x264";
+            if (c.Contains("av1")) return "av1";
+            return "";
+        }
+    }
+
+    public string InferredSourceHint
+    {
+        get
+        {
+            if (Fps is >= 24.8 and <= 25.2) return "PAL / TV";
+            if ((QualityLabel is "2160p" or "1080p") && Fps is >= 23.5 and <= 24.2)
+            {
+                if (VideoBitrateKbps >= 12000 || AudioChannels >= 6) return "BluRay / WEB-DL";
+                return "WEB-DL / BluRay";
+            }
+            if (QualityLabel == "720p" && Fps is >= 23.5 and <= 24.2) return "WEB / BluRay";
+            return "";
+        }
+    }
+
+    public bool HasAnySignal => Width > 0 || Fps > 0 || DurationSeconds > 0 || !string.IsNullOrWhiteSpace(EmbeddedTitle);
+
+    public string BuildSummaryLine()
+    {
+        var parts = new List<string>();
+        if (!string.IsNullOrEmpty(QualityLabel)) parts.Add(QualityLabel == "2160p" ? "4K (2160p)" : QualityLabel);
+        if (Fps > 1) parts.Add($"{Fps:0.###} fps");
+        if (!string.IsNullOrWhiteSpace(VideoCodec)) parts.Add(VideoCodec.ToUpperInvariant());
+        if (AudioChannels >= 6) parts.Add(AudioChannels >= 8 ? "7.1" : "5.1");
+        if (DurationSeconds > 5)
+        {
+            var ts = TimeSpan.FromSeconds(DurationSeconds);
+            parts.Add(ts.TotalHours >= 1
+                ? $"{(int)ts.TotalHours:D2}:{ts.Minutes:D2}:{ts.Seconds:D2}"
+                : $"{ts.Minutes:D2}:{ts.Seconds:D2}");
+        }
+        if (!string.IsNullOrEmpty(InferredSourceHint)) parts.Add(InferredSourceHint);
+        return string.Join("  •  ", parts);
+    }
+}
+
 public sealed class RecentFileEntry
 {
     public string Path { get; init; } = "";

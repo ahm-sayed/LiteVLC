@@ -10,6 +10,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using LiteVLC.Models;
 
 namespace LiteVLC.Services;
 
@@ -23,6 +24,7 @@ public sealed class ParsedMediaQuery
     public HashSet<string> ReleaseTokens { get; } = new(StringComparer.OrdinalIgnoreCase);
     public string? MovieHash { get; set; }
     public long? FileSize { get; set; }
+    public MediaProbeInfo? Probe { get; set; }
 }
 
 public sealed class SubtitleCandidate
@@ -36,6 +38,11 @@ public sealed class SubtitleCandidate
     public string DownloadUrl { get; init; } = "";
     public string EncodingHint { get; init; } = "";
     public string Source { get; init; } = "";
+    public double MovieFps { get; init; }
+    public long MovieTimeMs { get; init; }
+    public bool FpsMatched { get; set; }
+    public bool FpsMismatched { get; set; }
+    public bool QualityMatched { get; set; }
     public string MatchBadge { get; set; } = "MATCH";
     public string MatchBadgeBg { get; set; } = "#1A2236";
     public string MatchBadgeFg { get; set; } = "#94A3B8";
@@ -50,6 +57,14 @@ public sealed class SubtitleCandidate
         get
         {
             var parts = new List<string> { LanguageName, Format.ToUpperInvariant() };
+            if (MovieFps > 1)
+            {
+                string fpsTag = FpsMatched ? $"{MovieFps:0.###} fps ✓"
+                              : FpsMismatched ? $"{MovieFps:0.###} fps ⚠"
+                              : $"{MovieFps:0.###} fps";
+                parts.Add(fpsTag);
+            }
+            if (QualityMatched) parts.Add("Quality ✓");
             if (Downloads > 0) parts.Add($"{Downloads:N0} downloads");
             if (Rating > 0) parts.Add($"★ {Rating:0.0}");
             if (!string.IsNullOrWhiteSpace(Source)) parts.Add(Source);
@@ -126,12 +141,12 @@ public sealed class SubtitleSearchService
     }
 
     /// <summary>
-    /// Intelligently extracts clean Title, Season, Episode, Year, Release Tags, and File Hash.
-    /// Also inspects parent folders if the filename itself is generic (e.g. "Episode 01.mkv").
+    /// Intelligently extracts clean Title, Season, Episode, Year, Release Tags, File Hash,
+    /// AND merges real stream properties (Resolution, FPS, Codec, Duration, hidden MKV/MP4 metadata).
     /// </summary>
-    public static ParsedMediaQuery ParseMediaFile(string? mediaPath, string? fallbackTitle = null)
+    public static ParsedMediaQuery ParseMediaFile(string? mediaPath, string? fallbackTitle = null, MediaProbeInfo? probe = null)
     {
-        var parsed = new ParsedMediaQuery();
+        var parsed = new ParsedMediaQuery { Probe = probe };
         string rawName = "";
         string parentName = "";
         string grandParentName = "";
@@ -154,11 +169,38 @@ public sealed class SubtitleSearchService
             rawName = fallbackTitle ?? mediaPath ?? "";
         }
 
-        string lower = rawName.ToLowerInvariant();
+        // If the filename was renamed to something generic (e.g. "1.mp4", "video.mkv") but the container
+        // carries a real embedded release title in its header, mine it too!
+        string embeddedTitle = probe?.EmbeddedTitle ?? "";
+        string embeddedEncoder = probe?.EmbeddedEncoder ?? "";
+        string tagCorpus = $"{rawName} {embeddedTitle} {embeddedEncoder}".ToLowerInvariant();
+
         foreach (string tag in KnownReleaseTags)
         {
-            if (Regex.IsMatch(lower, $@"(^|[^a-z0-9]){Regex.Escape(tag)}([^a-z0-9]|$)"))
+            if (Regex.IsMatch(tagCorpus, $@"(^|[^a-z0-9]){Regex.Escape(tag)}([^a-z0-9]|$)"))
                 parsed.ReleaseTokens.Add(tag);
+        }
+
+        // Inject real probed resolution & codec from libmpv even if stripped from filename
+        if (probe != null)
+        {
+            if (!string.IsNullOrEmpty(probe.QualityLabel))
+            {
+                parsed.ReleaseTokens.Add(probe.QualityLabel);
+                if (probe.QualityLabel == "2160p") parsed.ReleaseTokens.Add("4k");
+            }
+            if (!string.IsNullOrEmpty(probe.CodecToken))
+            {
+                parsed.ReleaseTokens.Add(probe.CodecToken);
+                if (probe.CodecToken == "x265") parsed.ReleaseTokens.Add("hevc");
+            }
+        }
+
+        // If filename is purely generic ("1", "movie", "video", "film") and embeddedTitle looks meaningful, prefer embeddedTitle
+        if ((rawName.Length <= 2 || Regex.IsMatch(rawName, @"(?i)^(movie|video|film|clip|ep|episode|\d+)$"))
+            && embeddedTitle.Length >= 3)
+        {
+            rawName = embeddedTitle;
         }
 
         string normalized = Regex.Replace(rawName, @"[\._]+", " ");
@@ -317,15 +359,70 @@ public sealed class SubtitleSearchService
     {
         int score = 0;
         string combined = $"{c.FileName} {c.ReleaseName}".ToLowerInvariant();
+        var probe = local?.Probe;
 
         if (c.IsExactHash)
-            score += 1000;
+            score += 1200;
 
         if (c.Source.Contains("IMDB", StringComparison.OrdinalIgnoreCase) || c.Source.Contains("v3", StringComparison.OrdinalIgnoreCase))
             score += 240;
 
-        // Release token overlap with user's actual video file (e.g. 1080p, WEB-DL, BluRay, YTS, PSA, x265)
+        // --- 1. Exact FPS Synchronization Check (prevents gradual subtitle drift!) ---
+        if (probe is { Fps: > 1.0 } && c.MovieFps > 1.0)
+        {
+            double diff = Math.Abs(probe.Fps - c.MovieFps);
+            if (diff <= 0.15)
+            {
+                c.FpsMatched = true;
+                score += 220;
+            }
+            else if (diff >= 0.8)
+            {
+                // e.g. 25.0 fps PAL subtitle on a 23.976 fps BluRay/WEB movie will drift out of sync!
+                c.FpsMismatched = true;
+                score -= 320;
+            }
+        }
+
+        // --- 2. Video Duration / Cut Accuracy (Theatrical vs Extended / Director's Cut) ---
+        if (probe is { DurationSeconds: > 60 } && c.MovieTimeMs > 60_000)
+        {
+            double subSec = c.MovieTimeMs / 1000.0;
+            double deltaSec = Math.Abs(probe.DurationSeconds - subSec);
+            if (deltaSec <= 20) score += 150;
+            else if (deltaSec <= 90) score += 50;
+            else if (deltaSec > 180) score -= 180;
+        }
+
+        // --- 3. Real Probed Resolution, Codec, and Source/Release Token Matching ---
         int tokenMatches = 0;
+        if (probe != null)
+        {
+            if (!string.IsNullOrEmpty(probe.QualityLabel) &&
+                (combined.Contains(probe.QualityLabel, StringComparison.OrdinalIgnoreCase) ||
+                 (probe.QualityLabel == "2160p" && combined.Contains("4k", StringComparison.OrdinalIgnoreCase))))
+            {
+                c.QualityMatched = true;
+                score += 75;
+            }
+
+            if (!string.IsNullOrEmpty(probe.CodecToken) &&
+                (combined.Contains(probe.CodecToken, StringComparison.OrdinalIgnoreCase) ||
+                 (probe.CodecToken == "x265" && combined.Contains("hevc", StringComparison.OrdinalIgnoreCase))))
+            {
+                score += 35;
+            }
+
+            // Gently prefer BluRay/WEB-DL over CAM/TS when playing crisp 1080p/4K 23.976fps video
+            if ((probe.QualityLabel is "1080p" or "2160p") && probe.Fps is >= 23.5 and <= 24.2)
+            {
+                if (combined.Contains("bluray") || combined.Contains("web-dl") || combined.Contains("webrip") || combined.Contains("bdrip"))
+                    score += 45;
+                if (Regex.IsMatch(combined, @"\b(cam|hdcam|ts|telesync|hdts)\b"))
+                    score -= 160;
+            }
+        }
+
         if (local != null)
         {
             foreach (string tok in local.ReleaseTokens)
@@ -338,7 +435,7 @@ public sealed class SubtitleSearchService
             }
         }
 
-        // Confirm Season & Episode numbers match when searching a series
+        // --- 4. Confirm Season & Episode numbers match when searching a series ---
         if (season.HasValue && episode.HasValue)
         {
             string s2 = $"s{season.Value:D2}e{episode.Value:D2}";
@@ -348,7 +445,7 @@ public sealed class SubtitleSearchService
                 score += 160;
         }
 
-        // Popularity & quality bonus (log-scaled so popularity helps without overriding exact sync)
+        // --- 5. Popularity & quality bonus ---
         if (c.Downloads > 0)
             score += (int)(Math.Log10(c.Downloads + 1) * 28);
         if (c.Rating >= 8.0)
@@ -358,13 +455,26 @@ public sealed class SubtitleSearchService
 
         c.Score = score;
 
+        // Assign clear accuracy / sync badges
         if (c.IsExactHash)
         {
-            c.MatchBadge = "EXACT SYNC";
+            c.MatchBadge = "★ EXACT SYNC";
             c.MatchBadgeBg = "#0E291C";
             c.MatchBadgeFg = "#4ADE80";
         }
-        else if (tokenMatches >= 2)
+        else if (c.FpsMismatched)
+        {
+            c.MatchBadge = "FPS MISMATCH";
+            c.MatchBadgeBg = "#301A14";
+            c.MatchBadgeFg = "#F87171";
+        }
+        else if (c.FpsMatched && (c.QualityMatched || tokenMatches >= 2))
+        {
+            c.MatchBadge = "SYNC MATCH";
+            c.MatchBadgeBg = "#0D2926";
+            c.MatchBadgeFg = "#2DD4BF";
+        }
+        else if (c.FpsMatched || tokenMatches >= 2)
         {
             c.MatchBadge = "HIGH MATCH";
             c.MatchBadgeBg = "#0F2430";
@@ -512,6 +622,8 @@ public sealed class SubtitleSearchService
 
                 int.TryParse(GetStr(el, "SubDownloadsCnt"), NumberStyles.Any, CultureInfo.InvariantCulture, out int downloads);
                 double.TryParse(GetStr(el, "SubRating"), NumberStyles.Any, CultureInfo.InvariantCulture, out double rating);
+                double.TryParse(GetStr(el, "MovieFPS"), NumberStyles.Any, CultureInfo.InvariantCulture, out double movieFps);
+                long.TryParse(GetStr(el, "MovieTimeMS"), NumberStyles.Any, CultureInfo.InvariantCulture, out long movieTimeMs);
 
                 list.Add(new SubtitleCandidate
                 {
@@ -524,6 +636,8 @@ public sealed class SubtitleSearchService
                     DownloadUrl = dl,
                     EncodingHint = GetStr(el, "SubEncoding"),
                     Source = sourceLabel,
+                    MovieFps = movieFps,
+                    MovieTimeMs = movieTimeMs,
                     Downloads = downloads,
                     Rating = rating,
                     IsExactHash = exactHash

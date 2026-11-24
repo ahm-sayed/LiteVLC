@@ -551,6 +551,37 @@ public sealed class MpvEngine : IDisposable
         return stats;
     }
 
+    /// <summary>
+    /// Probes real stream quality, exact container FPS, codec, bitrate, duration, and hidden container metadata
+    /// directly from libmpv so subtitle search stays accurate even when a file has been renamed.
+    /// </summary>
+    public MediaProbeInfo GetMediaProbeInfo()
+    {
+        if (_handle == IntPtr.Zero || !HasMedia)
+            return new MediaProbeInfo();
+
+        double fps = GetDoubleProperty("container-fps");
+        if (fps <= 1.0) fps = GetDoubleProperty("estimated-vf-fps");
+
+        string titleMeta = GetStringProperty("metadata/by-key/title") ?? "";
+        string encoderMeta = GetStringProperty("metadata/by-key/encoder")
+                          ?? GetStringProperty("metadata/by-key/comment")
+                          ?? "";
+
+        return new MediaProbeInfo
+        {
+            Width = GetInt64Property("width"),
+            Height = GetInt64Property("height"),
+            Fps = fps > 0 ? Math.Round(fps, 3) : 0,
+            DurationSeconds = Duration > 0 ? Duration : GetDoubleProperty("duration"),
+            VideoCodec = GetStringProperty("video-codec-name") ?? GetStringProperty("video-format") ?? "",
+            VideoBitrateKbps = GetDoubleProperty("video-bitrate") / 1000.0,
+            AudioChannels = GetInt64Property("audio-params/channel-count"),
+            EmbeddedTitle = titleMeta.Trim(),
+            EmbeddedEncoder = encoderMeta.Trim()
+        };
+    }
+
     private string? GetStringProperty(string name)
     {
         if (_handle == IntPtr.Zero) return null;

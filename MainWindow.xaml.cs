@@ -1267,7 +1267,8 @@ public partial class MainWindow : Window
             ? _engine.CurrentTitle
             : (_currentIndex >= 0 && _currentIndex < _playlist.Count ? _playlist[_currentIndex].Title : null);
 
-        var dlg = new SubtitleSearchWindow(currentPath, fallbackTitle, _state.PreferredSubLang) { Owner = this };
+        var probe = _engine.GetMediaProbeInfo();
+        var dlg = new SubtitleSearchWindow(currentPath, fallbackTitle, _state.PreferredSubLang, probe) { Owner = this };
         if (dlg.ShowDialog() == true && !string.IsNullOrWhiteSpace(dlg.DownloadedSubtitlePath))
         {
             _state.PreferredSubLang = dlg.SelectedLanguageCode;

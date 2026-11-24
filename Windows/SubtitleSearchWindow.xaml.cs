@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using LiteVLC.Models;
 using LiteVLC.Services;
 
 namespace LiteVLC.Windows;
@@ -20,10 +21,10 @@ public partial class SubtitleSearchWindow : Window
     public string? DownloadedSubtitlePath { get; private set; }
     public string SelectedLanguageCode { get; private set; } = "ara";
 
-    public SubtitleSearchWindow(string? currentVideoPath, string? fallbackTitle, string preferredLang = "ara")
+    public SubtitleSearchWindow(string? currentVideoPath, string? fallbackTitle, string preferredLang = "ara", MediaProbeInfo? probe = null)
     {
         _currentVideoPath = currentVideoPath;
-        _parsed = SubtitleSearchService.ParseMediaFile(currentVideoPath, fallbackTitle);
+        _parsed = SubtitleSearchService.ParseMediaFile(currentVideoPath, fallbackTitle, probe);
         SelectedLanguageCode = string.IsNullOrWhiteSpace(preferredLang) ? "ara" : preferredLang;
 
         InitializeComponent();
@@ -48,6 +49,17 @@ public partial class SubtitleSearchWindow : Window
             HashBadgeText.Text = $"Hash: {_parsed.MovieHash}";
         else
             HashBadgeText.Text = "Title/IMDB Mode";
+
+        // Display real probed video fingerprint (Resolution, FPS, Codec, Duration, Source Hint)
+        if (probe is { HasAnySignal: true })
+        {
+            string summary = probe.BuildSummaryLine();
+            if (!string.IsNullOrWhiteSpace(summary))
+            {
+                VideoProfileText.Text = summary;
+                VideoProfileStrip.Visibility = Visibility.Visible;
+            }
+        }
 
         Loaded += async (_, _) =>
         {
@@ -86,10 +98,18 @@ public partial class SubtitleSearchWindow : Window
 
         try
         {
-            // Only use local hash if the user hasn't changed the title to a completely different movie
-            bool useHash = !string.IsNullOrEmpty(_parsed.MovieHash) &&
-                           (string.IsNullOrWhiteSpace(title) ||
-                            string.Equals(title, _parsed.Title, StringComparison.OrdinalIgnoreCase));
+            // Always keep probed FPS/resolution/duration for accurate sync scoring;
+            // only skip exact file hash if user typed a completely different title!
+            bool titleChanged = !string.IsNullOrWhiteSpace(title)
+                             && !string.IsNullOrWhiteSpace(_parsed.Title)
+                             && !string.Equals(title, _parsed.Title, StringComparison.OrdinalIgnoreCase);
+
+            ParsedMediaQuery? scoringContext = _parsed;
+            if (titleChanged)
+            {
+                scoringContext = new ParsedMediaQuery { Probe = _parsed.Probe };
+                foreach (var t in _parsed.ReleaseTokens) scoringContext.ReleaseTokens.Add(t);
+            }
 
             var (results, imdbInfo) = await _service.SearchAsync(
                 title,
@@ -97,7 +117,7 @@ public partial class SubtitleSearchWindow : Window
                 episode,
                 _parsed.Year,
                 lang,
-                useHash ? _parsed : null,
+                scoringContext,
                 ct);
 
             if (ct.IsCancellationRequested) return;
