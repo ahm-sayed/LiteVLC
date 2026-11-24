@@ -68,7 +68,7 @@ public partial class UpdateDialog : Window
             StatusBanner.BorderBrush = new SolidColorBrush(Color.FromRgb(0x25, 0x5E, 0x3F));
             StatusText.Foreground = new SolidColorBrush(Color.FromRgb(0x4A, 0xDE, 0x80));
             StatusText.Text = mb > 0
-                ? $"New version ready ({mb:0.1} MB). Click 'Update Now' to download, install silently, and restart automatically."
+                ? $"New version ready ({mb:F1} MB). Click 'Update Now' to download, install silently, and restart automatically."
                 : "New version ready. Click 'Update Now' to install and restart automatically.";
             NotesText.Text = string.IsNullOrWhiteSpace(res.ReleaseNotes) ? "Bug fixes and improvements." : res.ReleaseNotes;
             UpdateBtn.Visibility = Visibility.Visible;
@@ -112,11 +112,11 @@ public partial class UpdateDialog : Window
                     double ratio = Math.Clamp((double)p.Downloaded / p.Total, 0, 1);
                     ProgressScale.ScaleX = ratio;
                     ProgressPctText.Text = $"{ratio * 100:0}%";
-                    ProgressStatusText.Text = $"Downloading {dlMb:0.1} MB / {totMb:0.1} MB";
+                    ProgressStatusText.Text = $"Downloading {dlMb:F1} MB / {totMb:F1} MB";
                 }
                 else
                 {
-                    ProgressStatusText.Text = $"Downloading {dlMb:0.1} MB...";
+                    ProgressStatusText.Text = $"Downloading {dlMb:F1} MB...";
                 }
             });
 

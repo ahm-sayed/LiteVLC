@@ -162,7 +162,7 @@ public partial class OsdOverlayWindow : Window
         HudAudioText.Text = stats.AudioCodec;
         HudHwDecText.Text = stats.HwDec;
         HudFpsText.Text = stats.Fps > 0 ? $"{stats.Fps:0.00}" : "—";
-        HudCacheText.Text = $"{stats.CacheSeconds:0.1} s buffered";
+        HudCacheText.Text = $"{stats.CacheSeconds:F1} s buffered";
         HudAvSyncText.Text = $"{stats.AvSyncMs:+0.0;-0.0;0.0} ms";
         string mode = stats.FastSeekEnabled ? "Fast" : "Exact";
         HudSeekText.Text = stats.LastSeekMs > 0 ? $"{stats.LastSeekMs:0.0} ms ({mode})" : $"Ready ({mode})";

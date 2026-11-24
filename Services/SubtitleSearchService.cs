@@ -707,10 +707,9 @@ public sealed class SubtitleSearchService
     }
 
     /// <summary>
-    /// Downloads subtitle, auto-decompresses gzip, fixes Arabic CP1256 / legacy encodings to clean UTF-8,
-    /// and saves right next to the video file (or in %LocalAppData%\LiteVLC\Subtitles if read-only/stream).
+    /// Downloads and decodes subtitle bytes to clean UTF-8 text in memory (auto-gunzip + Arabic CP1256 fix).
     /// </summary>
-    public async Task<string> DownloadAndSaveAsync(SubtitleCandidate sub, string? currentVideoPath, CancellationToken ct)
+    public async Task<(string Text, string Ext)> DownloadTextAsync(SubtitleCandidate sub, CancellationToken ct)
     {
         using var req = new HttpRequestMessage(HttpMethod.Get, sub.DownloadUrl);
         req.Headers.TryAddWithoutValidation("User-Agent", "VLSub 0.11.1");
@@ -734,9 +733,24 @@ public sealed class SubtitleSearchService
         if (ext != "srt" && ext != "ass" && ext != "ssa" && ext != "vtt" && ext != "sub")
             ext = "srt";
 
+        return (text, ext);
+    }
+
+    public async Task<string> SaveSubtitleTextAsync(string text, string ext, SubtitleCandidate sub, string? currentVideoPath, CancellationToken ct)
+    {
         string targetPath = BuildOutputSubtitlePath(currentVideoPath, sub, ext);
         await File.WriteAllTextAsync(targetPath, text, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true), ct).ConfigureAwait(false);
         return targetPath;
+    }
+
+    /// <summary>
+    /// Downloads subtitle, auto-decompresses gzip, fixes Arabic CP1256 / legacy encodings to clean UTF-8,
+    /// and saves right next to the video file (or in %LocalAppData%\LiteVLC\Subtitles if read-only/stream).
+    /// </summary>
+    public async Task<string> DownloadAndSaveAsync(SubtitleCandidate sub, string? currentVideoPath, CancellationToken ct)
+    {
+        var (text, ext) = await DownloadTextAsync(sub, ct).ConfigureAwait(false);
+        return await SaveSubtitleTextAsync(text, ext, sub, currentVideoPath, ct).ConfigureAwait(false);
     }
 
     private static string DecodeSubtitleBytesToText(byte[] bytes, string langCode, string encodingHint)

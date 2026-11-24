@@ -1279,7 +1279,10 @@ public partial class MainWindow : Window
                 _engine.ResetSubDelay();
                 _engine.AddExternalSubtitle(dlg.DownloadedSubtitlePath);
             }
-            ShowOsd("Subtitle Applied", Path.GetFileName(dlg.DownloadedSubtitlePath), durationMs: 2200);
+            string detail = !string.IsNullOrWhiteSpace(dlg.SyncSummaryNote)
+                ? dlg.SyncSummaryNote
+                : Path.GetFileName(dlg.DownloadedSubtitlePath);
+            ShowOsd("Subtitle Synced & Applied", detail, durationMs: 3000);
         }
         else if (!string.IsNullOrWhiteSpace(dlg.SelectedLanguageCode))
         {
