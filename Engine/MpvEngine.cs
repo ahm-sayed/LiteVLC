@@ -34,6 +34,11 @@ public sealed class MpvEngine : IDisposable
     private long _lastAudioReloadTicks;
     private volatile bool _audioNeedsReload;
     private readonly Timer _deviceReloadDebounceTimer;
+    private readonly Timer _pauseSilenceReleaseTimer;
+
+    // Zero-lookahead dynamic voice/loudness boost (~5ms latency vs dynaudnorm's 1,200ms seek-refill lag!)
+    private const string ZeroLagAudioBoostFilter =
+        "lavfi=[acompressor=threshold=-22dB:ratio=3.5:attack=5:release=100:makeup=2.2,alimiter=limit=0.95:attack=2:release=40]";
 
     // Live cached playback state
     public double Position { get; private set; }
@@ -96,6 +101,15 @@ public sealed class MpvEngine : IDisposable
             if (!_disposed && HasMedia && !IsPaused)
                 ReloadAudioOutput();
         }, null, Timeout.Infinite, Timeout.Infinite);
+        _pauseSilenceReleaseTimer = new Timer(_ =>
+        {
+            // After 5 seconds of continuous pause, release WASAPI silence streaming so long pauses
+            // never cause Windows power-management / BT / HDMI audio invalidation.
+            IntPtr h;
+            lock (_lock) { h = _handle; }
+            if (!_disposed && h != IntPtr.Zero && IsPaused)
+                MpvNative.mpv_set_property_string(h, "audio-stream-silence", "no");
+        }, null, Timeout.Infinite, Timeout.Infinite);
     }
 
     public void Initialize(IntPtr hwnd, double initialVolume = 100, bool fastSeek = true, bool audioBoost = true)
@@ -125,12 +139,14 @@ public sealed class MpvEngine : IDisposable
             SetOpt("hwdec", "auto-safe");
             SetOpt("hwdec-codecs", "all");
 
-            // Loud, clear VLC-parity WASAPI audio (fixes quiet 5.1->stereo downmix & ReplayGain attenuation).
-            // Keep audio-stream-silence=no + audio-fallback-to-null=yes so long pauses / monitor sleep / BT idle
-            // NEVER permanently invalidate the WASAPI IAudioClient session!
+            // Loud, clear VLC-parity WASAPI audio with ZERO ±10s seek lag:
+            // - Keep audio-stream-silence=yes while playing/seeking so WASAPI never stops/restarts on +10s seek!
+            // - After 5s of pause, _pauseSilenceReleaseTimer flips it to "no" so long pauses never kill WASAPI.
+            // - Use zero-lookahead acompressor+alimiter (~5ms) instead of dynaudnorm (~1200ms seek refill lag!).
             SetOpt("ao", "wasapi");
-            SetOpt("audio-stream-silence", "no");
+            SetOpt("audio-stream-silence", "yes");
             SetOpt("audio-fallback-to-null", "yes");
+            SetOpt("audio-buffer", "0.1");
             SetOpt("audio-wait-open", "0");
             SetOpt("video-sync", "audio");
             SetOpt("audio-pitch-correction", "yes");
@@ -140,13 +156,13 @@ public sealed class MpvEngine : IDisposable
             SetOpt("volume-max", "200");
             SetOpt("volume-gain", audioBoost ? "6.0" : "4.5");
             if (audioBoost)
-                SetOpt("af", "lavfi=[dynaudnorm=f=150:g=15:p=0.92:m=8]");
+                SetOpt("af", ZeroLagAudioBoostFilter);
 
-            // Smart RAM demuxer cache (forward + backward) so ±10s seeks hit RAM instantly while keeping RAM lean
+            // Smart RAM demuxer cache (forward + backward) so ±10s / +20s seeks hit RAM instantly while keeping RAM lean
             SetOpt("cache", "yes");
             SetOpt("demuxer-max-bytes", "48MiB");
             SetOpt("demuxer-max-back-bytes", "20MiB");
-            SetOpt("demuxer-readahead-secs", "15");
+            SetOpt("demuxer-readahead-secs", "20");
 
             // Keyframe fast seeking by default (zero intermediate-frame stall)
             SetOpt("hr-seek", fastSeek ? "no" : "yes");
@@ -446,7 +462,7 @@ public sealed class MpvEngine : IDisposable
         AudioBoostEnabled = enabled;
         if (_handle == IntPtr.Zero) return;
         MpvNative.mpv_set_property_string(_handle, "volume-gain", enabled ? "6.0" : "4.5");
-        MpvNative.mpv_set_property_string(_handle, "af", enabled ? "lavfi=[dynaudnorm=f=150:g=15:p=0.92:m=8]" : "");
+        MpvNative.mpv_set_property_string(_handle, "af", enabled ? ZeroLagAudioBoostFilter : "");
     }
 
     public double AdjustSubDelay(double deltaSeconds)
@@ -839,9 +855,15 @@ public sealed class MpvEngine : IDisposable
                 {
                     if (_pausedAtTicks == 0)
                         _pausedAtTicks = Environment.TickCount64;
+                    // Release WASAPI silence stream after 5s of pause so long pauses never kill audio
+                    _pauseSilenceReleaseTimer.Change(5000, Timeout.Infinite);
                 }
                 else if (wasPaused && HasMedia)
                 {
+                    _pauseSilenceReleaseTimer.Change(Timeout.Infinite, Timeout.Infinite);
+                    // Re-enable persistent WASAPI silence during playback so ±10s seeks have 0ms audio hitch!
+                    MpvNative.mpv_set_property_string(_handle, "audio-stream-silence", "yes");
+
                     long pausedMs = _pausedAtTicks > 0 ? (Environment.TickCount64 - _pausedAtTicks) : 0;
                     _pausedAtTicks = 0;
 
@@ -856,6 +878,7 @@ public sealed class MpvEngine : IDisposable
                 }
                 else
                 {
+                    _pauseSilenceReleaseTimer.Change(Timeout.Infinite, Timeout.Infinite);
                     _pausedAtTicks = 0;
                 }
 
@@ -901,6 +924,7 @@ public sealed class MpvEngine : IDisposable
         _running = false;
         _seekCoalesceTimer.Dispose();
         _deviceReloadDebounceTimer.Dispose();
+        _pauseSilenceReleaseTimer.Dispose();
 
         IntPtr h;
         lock (_lock)
