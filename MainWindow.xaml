@@ -276,7 +276,7 @@
                 </Grid.ColumnDefinitions>
 
                 <!-- Native D3D11 Video Host Container -->
-                <Grid x:Name="StageContainer" Grid.Column="0" Background="#080A0F">
+                <Grid x:Name="StageContainer" Grid.Column="0" Background="#080A0F" MouseLeftButtonDown="StageContainer_MouseLeftButtonDown">
                     <ContentControl x:Name="VideoHostSlot"
                                     HorizontalContentAlignment="Stretch"
                                     VerticalContentAlignment="Stretch"

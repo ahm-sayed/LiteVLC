@@ -29,6 +29,12 @@ public sealed class MpvEngine : IDisposable
     private readonly Timer _seekCoalesceTimer;
     private long _seekStartTicks;
 
+    // WASAPI audio health & long-pause / sleep / device-change recovery state
+    private long _pausedAtTicks;
+    private long _lastAudioReloadTicks;
+    private volatile bool _audioNeedsReload;
+    private readonly Timer _deviceReloadDebounceTimer;
+
     // Live cached playback state
     public double Position { get; private set; }
     public double Duration { get; private set; }
@@ -85,6 +91,11 @@ public sealed class MpvEngine : IDisposable
         Directory.CreateDirectory(ScreenshotDirectory);
 
         _seekCoalesceTimer = new Timer(_ => FlushPendingSeek(), null, Timeout.Infinite, Timeout.Infinite);
+        _deviceReloadDebounceTimer = new Timer(_ =>
+        {
+            if (!_disposed && HasMedia && !IsPaused)
+                ReloadAudioOutput();
+        }, null, Timeout.Infinite, Timeout.Infinite);
     }
 
     public void Initialize(IntPtr hwnd, double initialVolume = 100, bool fastSeek = true, bool audioBoost = true)
@@ -114,9 +125,13 @@ public sealed class MpvEngine : IDisposable
             SetOpt("hwdec", "auto-safe");
             SetOpt("hwdec-codecs", "all");
 
-            // Loud, clear VLC-parity WASAPI audio (fixes quiet 5.1->stereo downmix & ReplayGain attenuation)
+            // Loud, clear VLC-parity WASAPI audio (fixes quiet 5.1->stereo downmix & ReplayGain attenuation).
+            // Keep audio-stream-silence=no + audio-fallback-to-null=yes so long pauses / monitor sleep / BT idle
+            // NEVER permanently invalidate the WASAPI IAudioClient session!
             SetOpt("ao", "wasapi");
-            SetOpt("audio-stream-silence", "yes");
+            SetOpt("audio-stream-silence", "no");
+            SetOpt("audio-fallback-to-null", "yes");
+            SetOpt("audio-wait-open", "0");
             SetOpt("video-sync", "audio");
             SetOpt("audio-pitch-correction", "yes");
             SetOpt("audio-normalize-downmix", "yes");
@@ -240,8 +255,56 @@ public sealed class MpvEngine : IDisposable
     public void SetPause(bool paused)
     {
         if (_handle == IntPtr.Zero) return;
+        if (paused)
+        {
+            if (_pausedAtTicks == 0)
+                _pausedAtTicks = Environment.TickCount64;
+        }
         int flag = paused ? 1 : 0;
         MpvNative.mpv_set_property(_handle, "pause", MpvFormat.Flag, ref flag);
+    }
+
+    /// <summary>
+    /// Marks WASAPI audio for clean reload (e.g., after PC sleep/wake or headphone/HDMI plug/unplug).
+    /// Reloads immediately if playing, or right upon unpausing if currently paused.
+    /// </summary>
+    public void MarkAudioNeedsReload()
+    {
+        if (_disposed || _handle == IntPtr.Zero || !HasMedia) return;
+        _audioNeedsReload = true;
+        if (!IsPaused)
+            _deviceReloadDebounceTimer.Change(450, Timeout.Infinite);
+    }
+
+    /// <summary>
+    /// Cleanly re-initializes the WASAPI audio output without interrupting video playback or losing position.
+    /// </summary>
+    public void ReloadAudioOutput(bool bypassCooldown = false)
+    {
+        if (_disposed || _handle == IntPtr.Zero || !HasMedia) return;
+        long now = Environment.TickCount64;
+        if (!bypassCooldown && now - _lastAudioReloadTicks < 1500)
+            return;
+        _lastAudioReloadTicks = now;
+        _audioNeedsReload = false;
+
+        MpvNative.CommandUtf8(_handle, true, "ao-reload");
+
+        // Re-assert volume & verify WASAPI re-attached cleanly after 450ms (e.g. waking HDMI/BT endpoint)
+        double vol = Volume;
+        MpvNative.mpv_set_property_async(_handle, 0, "volume", MpvFormat.Double, ref vol);
+
+        _ = System.Threading.Tasks.Task.Run(async () =>
+        {
+            await System.Threading.Tasks.Task.Delay(450).ConfigureAwait(false);
+            if (_disposed || _handle == IntPtr.Zero || !HasMedia || IsPaused) return;
+            string? ao = GetStringProperty("current-ao");
+            if ((string.IsNullOrEmpty(ao) || ao.Equals("null", StringComparison.OrdinalIgnoreCase)) &&
+                GetActiveAudioTrack() != null)
+            {
+                MpvNative.CommandUtf8(_handle, true, "ao-reload");
+            }
+        });
     }
 
     /// <summary>
@@ -767,9 +830,38 @@ public sealed class MpvEngine : IDisposable
                 break;
 
             case PropPause when prop.Format == MpvFormat.Flag:
-                IsPaused = Marshal.ReadInt32(prop.Data) != 0;
+            {
+                bool nowPaused = Marshal.ReadInt32(prop.Data) != 0;
+                bool wasPaused = IsPaused;
+                IsPaused = nowPaused;
+
+                if (nowPaused)
+                {
+                    if (_pausedAtTicks == 0)
+                        _pausedAtTicks = Environment.TickCount64;
+                }
+                else if (wasPaused && HasMedia)
+                {
+                    long pausedMs = _pausedAtTicks > 0 ? (Environment.TickCount64 - _pausedAtTicks) : 0;
+                    _pausedAtTicks = 0;
+
+                    string? currentAo = GetStringProperty("current-ao");
+                    bool aoDead = string.IsNullOrEmpty(currentAo) ||
+                                  currentAo.Equals("null", StringComparison.OrdinalIgnoreCase);
+
+                    // After a long pause (>=15s), Windows sleep, device switch, or dead WASAPI endpoint,
+                    // transparently reload WASAPI (~12ms) so audio NEVER stays silent on resume!
+                    if (_audioNeedsReload || aoDead || pausedMs >= 15_000)
+                        ReloadAudioOutput();
+                }
+                else
+                {
+                    _pausedAtTicks = 0;
+                }
+
                 PauseChanged?.Invoke(IsPaused);
                 break;
+            }
 
             case PropVolume when prop.Format == MpvFormat.Double:
                 Volume = Marshal.PtrToStructure<double>(prop.Data);
@@ -808,6 +900,7 @@ public sealed class MpvEngine : IDisposable
         _disposed = true;
         _running = false;
         _seekCoalesceTimer.Dispose();
+        _deviceReloadDebounceTimer.Dispose();
 
         IntPtr h;
         lock (_lock)

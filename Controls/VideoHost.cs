@@ -21,6 +21,12 @@ public sealed class VideoHost : HwndHost
     private bool _hasLastCursor;
     private int _lastCursorX;
     private int _lastCursorY;
+    private int _lastClickMsgTime;
+    private bool _hasLastClick;
+    private int _lastClickX;
+    private int _lastClickY;
+    private int _lastDblClickMsgTime;
+    private bool _hasLastDblClick;
 
     public IntPtr VideoHandle => _hwnd;
 
@@ -112,6 +118,12 @@ public sealed class VideoHost : HwndHost
 
     [DllImport("user32.dll")]
     private static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetDoubleClickTime();
+
+    [DllImport("user32.dll")]
+    private static extern int GetMessageTime();
 
     [DllImport("user32.dll")]
     private static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
@@ -229,13 +241,50 @@ public sealed class VideoHost : HwndHost
                 break;
 
             case WM_LBUTTONDBLCLK:
-                SyncCursorPosition();
-                Dispatcher.BeginInvoke(() => VideoDoubleClicked?.Invoke());
+            {
+                int msgTime = GetMessageTime();
+                _hasLastClick = false;
+                if (!_hasLastDblClick || unchecked(msgTime - _lastDblClickMsgTime) > 150)
+                {
+                    _hasLastDblClick = true;
+                    _lastDblClickMsgTime = msgTime;
+                    SyncCursorPosition();
+                    Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Send, () => VideoDoubleClicked?.Invoke());
+                }
                 return IntPtr.Zero;
+            }
 
             case WM_LBUTTONDOWN:
-                Dispatcher.BeginInvoke(() => VideoSingleClicked?.Invoke());
+            {
+                int msgTime = GetMessageTime();
+                int x = (short)(lParam.ToInt64() & 0xFFFF);
+                int y = (short)((lParam.ToInt64() >> 16) & 0xFFFF);
+                int dblWindow = (int)Math.Clamp(GetDoubleClickTime(), 320u, 550u);
+
+                // Use Win32 GetMessageTime() (true click post time, immune to UI thread stalls) and ±16px
+                // tolerance so double-click is NEVER missed even with slight high-DPI mouse jitter!
+                int delta = unchecked(msgTime - _lastClickMsgTime);
+                if (_hasLastClick &&
+                    delta >= 0 && delta <= dblWindow &&
+                    Math.Abs(x - _lastClickX) <= 16 &&
+                    Math.Abs(y - _lastClickY) <= 16)
+                {
+                    _hasLastClick = false;
+                    _hasLastDblClick = true;
+                    _lastDblClickMsgTime = msgTime;
+                    SyncCursorPosition();
+                    Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Send, () => VideoDoubleClicked?.Invoke());
+                }
+                else
+                {
+                    _hasLastClick = true;
+                    _lastClickMsgTime = msgTime;
+                    _lastClickX = x;
+                    _lastClickY = y;
+                    Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Input, () => VideoSingleClicked?.Invoke());
+                }
                 return IntPtr.Zero;
+            }
 
             case WM_RBUTTONUP:
                 Dispatcher.BeginInvoke(() => VideoRightClicked?.Invoke());

@@ -45,6 +45,9 @@ public partial class MainWindow : Window
     private CancellationTokenSource? _subSyncCts;
     private bool _isSubSyncChecking;
     private string? _lastCheckedSubKey;
+    private long _lastSingleClickPauseTick;
+    private bool _wasPausedBeforeSingleClick;
+    private HwndSource? _hwndSource;
 
     private int _fsLastCursorX;
     private int _fsLastCursorY;
@@ -108,6 +111,12 @@ public partial class MainWindow : Window
 
     [DllImport("user32.dll")]
     private static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetDoubleClickTime();
+
+    private const int WM_DEVICECHANGE = 0x0219;
+    private const int DBT_DEVNODES_CHANGED = 0x0007;
 
     [DllImport("user32.dll")]
     private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
@@ -211,16 +220,18 @@ public partial class MainWindow : Window
                 _ = RunSubtitleSyncCheckAsync(isManual: false);
         };
 
-        // Distinguish single-click (Play/Pause) from double-click (Fullscreen) cleanly
-        _clickTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(210) };
+        // Distinguish single-click (Play/Pause) from double-click (instant Fullscreen without pausing!)
+        _clickTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(320) };
         _clickTimer.Tick += (_, _) =>
         {
             _clickTimer.Stop();
             if (_engine.HasMedia)
             {
-                bool willResume = _engine.IsPaused;
+                bool wasPaused = _engine.IsPaused;
+                _wasPausedBeforeSingleClick = wasPaused;
+                _lastSingleClickPauseTick = Environment.TickCount64;
                 _engine.TogglePause();
-                ShowOsd(willResume ? "Playing" : "Paused", FormatTime(_engine.Position));
+                ShowOsd(wasPaused ? "Playing" : "Paused", FormatTime(_engine.Position));
             }
         };
 
@@ -258,6 +269,18 @@ public partial class MainWindow : Window
         _videoHost.VideoDoubleClicked += () =>
         {
             _clickTimer.Stop();
+
+            // If a casual slower double-click (>320ms, <= OS double-click time) already fired the single-click
+            // pause toggle right before click #2 arrived, seamlessly revert it so double-click NEVER pauses playback!
+            long dblLimit = Math.Max((long)GetDoubleClickTime() + 250, 750);
+            if (_engine.HasMedia && _lastSingleClickPauseTick > 0 &&
+                (Environment.TickCount64 - _lastSingleClickPauseTick) <= dblLimit)
+            {
+                _lastSingleClickPauseTick = 0;
+                _engine.SetPause(_wasPausedBeforeSingleClick);
+                _osdOverlay?.HideOsdImmediate();
+            }
+
             ToggleFullscreen();
         };
 
@@ -444,6 +467,34 @@ public partial class MainWindow : Window
         IntPtr hwnd = new WindowInteropHelper(this).Handle;
         int dark = 1;
         DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ref dark, sizeof(int));
+
+        // Listen for Windows audio device plug/unplug (Bluetooth/HDMI/USB DAC) & sleep wake
+        // so WASAPI audio automatically recovers without restarting LiteVLC.
+        _hwndSource = HwndSource.FromHwnd(hwnd);
+        _hwndSource?.AddHook(WndProcHook);
+        SystemEvents.PowerModeChanged += OnSystemPowerModeChanged;
+    }
+
+    private IntPtr WndProcHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (msg == WM_DEVICECHANGE && wParam.ToInt32() == DBT_DEVNODES_CHANGED)
+            _engine.MarkAudioNeedsReload();
+        return IntPtr.Zero;
+    }
+
+    private void OnSystemPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
+    {
+        if (e.Mode == PowerModes.Resume)
+            _engine.MarkAudioNeedsReload();
+    }
+
+    private void StageContainer_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ClickCount == 2 && _engine.HasMedia && EmptyStatePanel.Visibility != Visibility.Visible)
+        {
+            ToggleFullscreen();
+            e.Handled = true;
+        }
     }
 
     private void Window_Loaded(object sender, RoutedEventArgs e)
@@ -514,6 +565,8 @@ public partial class MainWindow : Window
         _autoSaveTimer.Stop();
         _autoSyncDebounceTimer.Stop();
         CancelSubtitleSyncCheck(resetBadge: false);
+        SystemEvents.PowerModeChanged -= OnSystemPowerModeChanged;
+        _hwndSource?.RemoveHook(WndProcHook);
         _fsControls?.Close();
         _osdOverlay?.Close();
         _engine.Dispose();
@@ -1197,6 +1250,18 @@ public partial class MainWindow : Window
         };
         boostItem.Click += (_, _) => ToggleAudioBoost();
         menu.Items.Add(boostItem);
+
+        var resetAudioItem = new MenuItem
+        {
+            Header = "Reset / Reconnect Audio Output",
+            IsEnabled = _engine.HasMedia
+        };
+        resetAudioItem.Click += (_, _) =>
+        {
+            _engine.ReloadAudioOutput(bypassCooldown: true);
+            ShowOsd("Audio Output Reconnected", "WASAPI refreshed");
+        };
+        menu.Items.Add(resetAudioItem);
         menu.Items.Add(new Separator());
 
         var offItem = new MenuItem { Header = "Disable Audio", IsCheckable = true, IsChecked = tracks.All(t => !t.Selected) };

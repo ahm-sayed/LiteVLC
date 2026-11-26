@@ -108,6 +108,15 @@ public partial class OsdOverlayWindow : Window
         _osdHideTimer.Start();
     }
 
+    public void HideOsdImmediate()
+    {
+        _osdHideTimer.Stop();
+        _osdActive = false;
+        OsdPill.BeginAnimation(OpacityProperty, null);
+        OsdPill.Opacity = 0;
+        HideIfCompletelyIdle();
+    }
+
     public void ShowSkipIndicator(double deltaSeconds, string targetTimeText)
     {
         _skipActive = true;

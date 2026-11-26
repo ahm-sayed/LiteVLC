@@ -1,5 +1,5 @@
 #define MyAppName "LiteVLC"
-#define MyAppVersion "1.6.1"
+#define MyAppVersion "1.6.2"
 #define MyAppPublisher "Ahmed Sayed"
 #define MyAppURL "https://github.com/ahm-sayed/LiteVLC"
 #define MyAppExeName "LiteVLC.exe"
