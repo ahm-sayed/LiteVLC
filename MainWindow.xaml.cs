@@ -1138,6 +1138,11 @@ public partial class MainWindow : Window
                 e.Handled = true;
                 break;
 
+            case Key.R when !ctrl && _playlist.Count > 1:
+                ShufflePlaylist();
+                e.Handled = true;
+                break;
+
             case Key.O when ctrl:
                 OpenFileDialog();
                 e.Handled = true;
@@ -1979,7 +1984,7 @@ public partial class MainWindow : Window
         if (_isPlaylistOpen)
         {
             PlaylistDrawer.Visibility = Visibility.Visible;
-            var wAnim = new DoubleAnimation(PlaylistDrawer.ActualWidth, 310, TimeSpan.FromMilliseconds(220)) { EasingFunction = ease };
+            var wAnim = new DoubleAnimation(PlaylistDrawer.ActualWidth, 332, TimeSpan.FromMilliseconds(220)) { EasingFunction = ease };
             var oAnim = new DoubleAnimation(PlaylistDrawer.Opacity, 1.0, TimeSpan.FromMilliseconds(180)) { EasingFunction = ease };
             wAnim.Completed += (_, _) => { if (_osdOverlay?.IsVisible == true) SyncOverlayBounds(); };
             PlaylistDrawer.BeginAnimation(WidthProperty, wAnim);
@@ -2000,6 +2005,57 @@ public partial class MainWindow : Window
     }
 
     private void AddToPlaylist_Click(object sender, RoutedEventArgs e) => OpenFileDialog(appendToPlaylist: true);
+
+    private void ShufflePlaylist_Click(object sender, RoutedEventArgs e) => ShufflePlaylist();
+
+    private void ShufflePlaylist()
+    {
+        if (_playlist.Count < 2)
+        {
+            ShowOsd("Need 2+ Items to Mix", "Add more files to playlist first");
+            return;
+        }
+
+        PlaylistItem? activeItem = (_currentIndex >= 0 && _currentIndex < _playlist.Count)
+            ? _playlist[_currentIndex]
+            : null;
+
+        var original = _playlist.ToList();
+        var shuffled = original.ToList();
+
+        // Fisher-Yates unbiased shuffle; guarantee order visibly changes when Count >= 2
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            for (int i = shuffled.Count - 1; i > 0; i--)
+            {
+                int j = Random.Shared.Next(i + 1);
+                (shuffled[i], shuffled[j]) = (shuffled[j], shuffled[i]);
+            }
+
+            if (!shuffled.SequenceEqual(original))
+                break;
+        }
+
+        if (shuffled.SequenceEqual(original))
+            (shuffled[0], shuffled[1]) = (shuffled[1], shuffled[0]);
+
+        _playlist.Clear();
+        foreach (var item in shuffled)
+            _playlist.Add(item);
+
+        if (activeItem != null)
+        {
+            _currentIndex = _playlist.IndexOf(activeItem);
+            PlaylistListBox.SelectedIndex = _currentIndex;
+            PlaylistListBox.ScrollIntoView(activeItem);
+        }
+        else
+        {
+            _currentIndex = -1;
+        }
+
+        ShowOsd("Playlist Mixed", $"{_playlist.Count} items shuffled randomly");
+    }
 
     private void ClearPlaylist_Click(object sender, RoutedEventArgs e)
     {
@@ -2050,6 +2106,10 @@ public partial class MainWindow : Window
             menu.Items.Add(removeMi);
             menu.Items.Add(new Separator());
         }
+
+        var mixMi = new MenuItem { Header = "Mix / Shuffle Playlist Randomly", InputGestureText = "R", IsEnabled = _playlist.Count > 1 };
+        mixMi.Click += (_, _) => ShufflePlaylist();
+        menu.Items.Add(mixMi);
 
         var saveMi = new MenuItem { Header = "Save Playlist (.xspf / .m3u8)...", IsEnabled = _playlist.Count > 0 };
         saveMi.Click += (_, _) => SavePlaylistDialog();

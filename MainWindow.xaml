@@ -455,39 +455,53 @@
                         BorderBrush="#1C2438"
                         BorderThickness="1,0,0,0"
                         ClipToBounds="True">
-                    <Grid Width="310">
+                    <Grid Width="332">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="*"/>
                             <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
 
-                        <Border Grid.Row="0" Padding="14,12" BorderBrush="#1A2234" BorderThickness="0,0,0,1">
+                        <Border Grid.Row="0" Padding="12,12" BorderBrush="#1A2234" BorderThickness="0,0,0,1">
                             <Grid>
                                 <TextBlock x:Name="PlaylistHeaderText"
                                            Text="Playlist (0)"
-                                           FontSize="13.5"
+                                           FontSize="13"
                                            FontWeight="SemiBold"
                                            Foreground="#F8FAFC"
                                            VerticalAlignment="Center"/>
                                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                    <Button x:Name="ShufflePlaylistBtn"
+                                            Style="{StaticResource PillButtonStyle}"
+                                            Padding="7,3"
+                                            Margin="0,0,5,0"
+                                            ToolTip="Mix / Shuffle Playlist Randomly (R)"
+                                            Click="ShufflePlaylist_Click">
+                                        <StackPanel Orientation="Horizontal">
+                                            <Path Data="M 1,4 L 4.5,4 L 10.5,12 L 14,12 M 12,10 L 14.5,12 L 12,14 M 1,12 L 4.5,12 L 6.8,9 M 8.8,6.3 L 10.5,4 L 14,4 M 12,2 L 14.5,4 L 12,6"
+                                                  Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}"
+                                                  StrokeThickness="1.5" StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" Fill="Transparent"
+                                                  Width="12" Height="11" Stretch="Uniform" Margin="0,0,4,0"/>
+                                            <TextBlock Text="Mix" FontSize="11" VerticalAlignment="Center"/>
+                                        </StackPanel>
+                                    </Button>
                                     <Button x:Name="LoopBtn"
                                             Content="Loop: Off"
                                             Style="{StaticResource PillButtonStyle}"
-                                            Padding="8,3"
+                                            Padding="7,3"
                                             FontSize="11"
-                                            Margin="0,0,6,0"
+                                            Margin="0,0,5,0"
                                             Click="CycleLoopMode_Click"/>
                                     <Button Content="+"
                                             Style="{StaticResource IconButtonStyle}"
-                                            Padding="8,3"
+                                            Padding="7,3"
                                             FontSize="14"
                                             FontWeight="Bold"
                                             ToolTip="Add Files to Playlist"
                                             Click="AddToPlaylist_Click"/>
                                     <Button Content="Clear"
                                             Style="{StaticResource IconButtonStyle}"
-                                            Padding="7,3"
+                                            Padding="6,3"
                                             FontSize="11.5"
                                             Click="ClearPlaylist_Click"/>
                                 </StackPanel>
